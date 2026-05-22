@@ -87,6 +87,12 @@ const SUPPORTED_KINDS = new Set([
   'StorageClass',
 ]);
 
+const TRIGGER_EVENT_KINDS = new Set(['EventListener', 'EventSource', 'Sensor']);
+
+function isSupportedKind(kind: string): boolean {
+  return SUPPORTED_KINDS.has(kind) || kind.toLowerCase().includes('trigger') || TRIGGER_EVENT_KINDS.has(kind);
+}
+
 function parseResources(manifest: string): { resources: ManifestResource[]; issues: ValidationIssue[] } {
   const issues: ValidationIssue[] = [];
   const resources: ManifestResource[] = [];
@@ -121,7 +127,7 @@ function parseResources(manifest: string): { resources: ManifestResource[]; issu
     if (!name) {
       issues.push({ severity: 'error', message: 'Missing metadata.name', resource: resourceLabel });
     }
-    if (kind && !SUPPORTED_KINDS.has(kind)) {
+    if (kind && !isSupportedKind(kind)) {
       issues.push({ severity: 'warning', message: `Kind ${kind} is not in the Nexus demo allow-list`, resource: resourceLabel });
     }
 
