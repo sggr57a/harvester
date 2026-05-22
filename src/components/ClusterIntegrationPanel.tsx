@@ -3,6 +3,7 @@ import {
   ApplyTestRun,
   CsiTemplatePreview,
   LivePreview,
+  NexusClusterOperationBundle,
   ValidationResult,
   VClusterPlan,
 } from '../lib/clusterWorkflow';
@@ -13,6 +14,7 @@ interface ClusterIntegrationPanelProps {
   applyRun: ApplyTestRun;
   vclusterPlan: VClusterPlan;
   csiPreview: CsiTemplatePreview;
+  operationBundle: NexusClusterOperationBundle;
   config: ApplicationConfig;
 }
 
@@ -22,13 +24,14 @@ export function ClusterIntegrationPanel({
   applyRun,
   vclusterPlan,
   csiPreview,
+  operationBundle,
   config,
 }: ClusterIntegrationPanelProps) {
   return (
     <section className="cluster-console hud-panel" aria-label="Nexus next steps cluster integration console">
       <div className="hud-panel-title cluster-console-title">
         <span>README next steps console</span>
-        <strong>{applyRun.status === 'passed' ? 'all demo checks green' : 'attention required'}</strong>
+        <strong>{operationBundle.mode === 'live-adapter' && applyRun.status === 'passed' ? 'live adapter staged' : 'attention required'}</strong>
       </div>
 
       <div className="cluster-step-grid">
@@ -37,6 +40,7 @@ export function ClusterIntegrationPanel({
             <span>01</span>
             <h3>Kubernetes API validation + live preview</h3>
           </div>
+          <div className="csi-driver-pill">{operationBundle.apiEndpoints[0]}</div>
           <div className={`cluster-score ${validation.valid ? 'is-green' : 'is-warn'}`}>
             {livePreview.readinessScore}
             <span>%</span>
@@ -75,7 +79,8 @@ export function ClusterIntegrationPanel({
               </div>
             ))}
           </div>
-          <code>{applyRun.commands[0]}</code>
+          <code>{operationBundle.kubectlCommands[0]}</code>
+          <code>{operationBundle.kubectlCommands[1]}</code>
         </article>
 
         <article className="cluster-step-card cluster-vcluster">
@@ -92,7 +97,7 @@ export function ClusterIntegrationPanel({
             ))}
           </div>
           <p>{vclusterPlan.serviceDiscovery}</p>
-          <code>{vclusterPlan.commands[0]}</code>
+          <code>{operationBundle.vclusterCommands[0]}</code>
         </article>
 
         <article className="cluster-step-card cluster-editor">
@@ -115,6 +120,14 @@ export function ClusterIntegrationPanel({
             <h3>Real CSI storage templates</h3>
           </div>
           <div className="csi-driver-pill">{csiPreview.driverName}</div>
+          <ul>
+            {operationBundle.csiSourceFiles.map((sourceFile) => (
+              <li key={sourceFile}>
+                <span />
+                {sourceFile}
+              </li>
+            ))}
+          </ul>
           <div className="csi-template-list">
             {csiPreview.templates.map((template) => (
               <details key={`${template.kind}-${template.name}`} open={template.kind === 'StorageClass'}>
@@ -130,6 +143,7 @@ export function ClusterIntegrationPanel({
         <span>target namespace: {config.namespace}</span>
         <span>workload: {config.workloadType}/{config.appName}</span>
         <span>storage class: {csiPreview.storageClassName}</span>
+        <span>source: {operationBundle.harvesterSourceRoot}</span>
       </div>
     </section>
   );

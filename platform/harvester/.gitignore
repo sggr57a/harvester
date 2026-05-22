@@ -1,0 +1,16 @@
+/.dapper
+/.cache
+/bin
+/dist
+*.swp
+.idea
+/harvester
+.DS_Store
+api.test
+.docker
+.nocalhost
+package/harvester
+package/harvester-webhook
+package/upgrade/upgrade-helper
+package/upgrade/addons
+scripts/.version_env

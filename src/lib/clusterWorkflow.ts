@@ -60,6 +60,18 @@ export interface CsiTemplatePreview {
   installCommands: string[];
 }
 
+export interface NexusClusterOperationBundle {
+  mode: 'live-adapter';
+  harvesterSourceRoot: 'platform/harvester';
+  apiEndpoints: string[];
+  validation: ValidationResult;
+  preview: LivePreview;
+  applyRun: ApplyTestRun;
+  kubectlCommands: string[];
+  vclusterCommands: string[];
+  csiSourceFiles: string[];
+}
+
 const SUPPORTED_KINDS = new Set([
   'Application',
   'CiliumNetworkPolicy',
@@ -274,6 +286,42 @@ export function buildCsiTemplatePreview(storage: StorageConfig): CsiTemplatePrev
       `kubectl apply -f ${storage.storageType}-csi-driver.yaml`,
       `kubectl apply -f ${storageClassName}-storageclass.yaml`,
       `kubectl apply -f ${storage.storageType}-demo-pvc.yaml`,
+    ],
+  };
+}
+
+export function buildNexusClusterOperationBundle(manifest: string, config: ApplicationConfig): NexusClusterOperationBundle {
+  const validation = validateKubernetesManifest(manifest);
+  const preview = buildLivePreview(manifest);
+  const applyRun = buildApplyTestRun(manifest, config);
+  const vclusterPlan = buildVClusterPlan(config);
+  const namespace = config.namespace || 'default';
+  const workloadResource = config.workloadType.toLowerCase();
+
+  return {
+    mode: 'live-adapter',
+    harvesterSourceRoot: 'platform/harvester',
+    apiEndpoints: [
+      '/api/nexus/kubernetes/validate',
+      '/api/nexus/kubectl/apply',
+      '/api/nexus/vclusters',
+      '/api/nexus/storage/csi',
+    ],
+    validation,
+    preview,
+    applyRun,
+    kubectlCommands: [
+      `kubectl auth can-i create ${workloadResource}s -n ${namespace}`,
+      `kubectl apply --server-side --dry-run=server -n ${namespace} -f nexus-generated.yaml`,
+      `kubectl diff -n ${namespace} -f nexus-generated.yaml`,
+      `kubectl apply --server-side -n ${namespace} -f nexus-generated.yaml`,
+      `kubectl rollout status ${workloadResource}/${config.appName} -n ${namespace}`,
+    ],
+    vclusterCommands: vclusterPlan.commands,
+    csiSourceFiles: [
+      'platform/harvester/deploy/charts/harvester/templates/harvester-storageclass.yaml',
+      'platform/harvester/deploy/charts/harvester/templates/longhorn-volumesnapshotclass.yaml',
+      'platform/harvester/deploy/charts/harvester/dependency_charts/csi-snapshotter/templates/snapshotclass.yaml',
     ],
   };
 }

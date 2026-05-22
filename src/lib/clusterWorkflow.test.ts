@@ -4,6 +4,7 @@ import {
   buildApplyTestRun,
   buildCsiTemplatePreview,
   buildLivePreview,
+  buildNexusClusterOperationBundle,
   buildVClusterPlan,
   validateKubernetesManifest,
 } from './clusterWorkflow';
@@ -60,5 +61,30 @@ describe('cluster workflow helpers', () => {
     expect(vclusterPlan.commands[0]).toContain('vcluster create edge-a');
     expect(csiPreview.driverName).toContain('rook-ceph');
     expect(csiPreview.templates.some((template) => template.kind === 'StorageClass')).toBe(true);
+  });
+
+  it('builds a live-adapter operation bundle for the completed README next steps', () => {
+    const bundle = buildNexusClusterOperationBundle(manifest, {
+      ...defaultConfig,
+      namespace: 'apps',
+      multiCluster: {
+        enableMultiCluster: true,
+        clusters: [{ name: 'edge-a' }],
+        serviceDiscovery: true,
+      },
+    });
+
+    expect(bundle.mode).toBe('live-adapter');
+    expect(bundle.harvesterSourceRoot).toBe('platform/harvester');
+    expect(bundle.apiEndpoints).toEqual([
+      '/api/nexus/kubernetes/validate',
+      '/api/nexus/kubectl/apply',
+      '/api/nexus/vclusters',
+      '/api/nexus/storage/csi',
+    ]);
+    expect(bundle.kubectlCommands).toContain('kubectl auth can-i create deployments -n apps');
+    expect(bundle.vclusterCommands[0]).toContain('vcluster create edge-a --namespace edge-a-vcluster');
+    expect(bundle.csiSourceFiles).toContain('platform/harvester/deploy/charts/harvester/templates/harvester-storageclass.yaml');
+    expect(bundle.validation.valid).toBe(true);
   });
 });

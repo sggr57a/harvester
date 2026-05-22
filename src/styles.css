@@ -2645,3 +2645,132 @@ select option {
 @keyframes launch-step-in {
   to { opacity: 1; transform: translateX(0); }
 }
+
+/* Nexus machine wizard: Harvester platform source + install flow */
+.machine-wizard {
+  position: relative;
+  overflow: hidden;
+  padding: 1rem;
+  background:
+    radial-gradient(circle at 85% 15%, rgba(117, 255, 106, 0.1), transparent 32%),
+    linear-gradient(135deg, rgba(4, 9, 17, 0.98), rgba(1, 4, 9, 0.94));
+}
+
+.machine-wizard-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(320px, 0.85fr);
+  gap: 1rem;
+}
+
+.machine-wizard-form,
+.machine-plan,
+.machine-config-preview,
+.machine-source-card,
+.machine-issues {
+  border: 1px solid rgba(51, 247, 255, 0.16);
+  background: rgba(0, 5, 11, 0.72);
+  box-shadow: inset 0 0 24px rgba(51, 247, 255, 0.04);
+}
+
+.machine-wizard-form,
+.machine-plan {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+}
+
+.machine-steps {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.machine-step {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 0.7rem;
+  align-items: center;
+  padding: 0.7rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(1, 8, 16, 0.82);
+  animation: hudPulse 3.4s ease-in-out infinite;
+}
+
+.machine-step span {
+  display: grid;
+  width: 2.1rem;
+  height: 2.1rem;
+  place-items: center;
+  border-radius: 999px;
+  border: 1px solid rgba(51, 247, 255, 0.4);
+  color: var(--hud-cyan);
+}
+
+.machine-step strong,
+.machine-source-card strong {
+  display: block;
+  color: var(--nexus-focus-white);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.machine-step small,
+.machine-source-card small {
+  color: var(--hud-muted);
+}
+
+.machine-step.required {
+  border-color: rgba(255, 221, 102, 0.36);
+}
+
+.machine-step.ready {
+  border-color: rgba(117, 255, 106, 0.24);
+  box-shadow: inset 0 0 18px rgba(117, 255, 106, 0.08);
+}
+
+.machine-source-card,
+.machine-issues,
+.machine-config-preview {
+  padding: 1rem;
+}
+
+.machine-source-card span {
+  color: var(--hud-green);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+}
+
+.machine-issues {
+  display: grid;
+  gap: 0.35rem;
+  margin-top: 1rem;
+  border-color: rgba(255, 221, 102, 0.32);
+}
+
+.machine-issues p {
+  margin: 0;
+  color: #ffdd66;
+}
+
+.machine-config-preview {
+  display: grid;
+  gap: 0.8rem;
+  margin-top: 1rem;
+}
+
+.machine-config-preview pre {
+  max-height: 280px;
+  overflow: auto;
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid rgba(51, 247, 255, 0.16);
+  background: rgba(0, 0, 0, 0.58);
+  color: var(--nexus-focus-white);
+  white-space: pre-wrap;
+}
+
+@media (max-width: 1180px) {
+  .machine-wizard-grid {
+    grid-template-columns: 1fr;
+  }
+}

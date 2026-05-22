@@ -1,0 +1,54 @@
+#!/bin/bash
+# DESC: Build the Harvester container image
+set -e
+
+TOP_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." &> /dev/null && pwd )"
+SCRIPTS_DIR="${TOP_DIR}/scripts"
+PACKAGE_DIR="${TOP_DIR}/package"
+
+source $SCRIPTS_DIR/version
+
+cd $TOP_DIR
+
+mkdir -p dist/artifacts
+cp bin/harvester dist/artifacts/harvester${SUFFIX}
+
+cd $PACKAGE_DIR
+
+IMAGE=${REPO}/harvester:${TAG}
+DOCKERFILE=Dockerfile
+if [ -e ${DOCKERFILE}.${ARCH} ]; then
+  DOCKERFILE=${DOCKERFILE}.${ARCH}
+fi
+
+rm -rf ./harvester
+cp ../bin/harvester .
+
+BUILD_ARGS="--build-arg VERSION=${VERSION} --build-arg ARCH=${ARCH}"
+if [ -n "${HARVESTER_UI_VERSION}" ]; then
+  BUILD_ARGS="${BUILD_ARGS} --build-arg HARVESTER_UI_VERSION=${HARVESTER_UI_VERSION}"
+fi
+if [ -n "${HARVESTER_UI_PLUGIN_BUNDLED_VERSION}" ]; then
+  BUILD_ARGS="${BUILD_ARGS} --build-arg HARVESTER_UI_PLUGIN_BUNDLED_VERSION=${HARVESTER_UI_PLUGIN_BUNDLED_VERSION}"
+fi
+
+docker build $BUILD_ARGS -f ${DOCKERFILE} -t ${IMAGE} .
+echo Built ${IMAGE}
+
+IMAGE_PUSH=${REPO}/harvester:${IMAGE_PUSH_TAG}
+docker tag "${IMAGE}" "${IMAGE_PUSH}"
+echo Tagged "${IMAGE_PUSH}"
+
+DOCKER_CONFIG="${TOP_DIR}/.docker"
+if [[ -n ${PUSH} ]];then
+  extra_args=""
+
+  if [ -d "${DOCKER_CONFIG}" ]; then
+    extra_args="--config=${DOCKER_CONFIG}"
+  else
+    echo "Docker config directory ${DOCKER_CONFIG} does not exist. Using default docker config."
+  fi
+
+  docker $extra_args push "${IMAGE_PUSH}"
+  echo Pushed "${IMAGE_PUSH}"
+fi

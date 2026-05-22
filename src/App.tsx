@@ -1,12 +1,14 @@
 import { useMemo, useState } from 'react';
 import { ApplicationConfig, defaultConfig, StorageType } from './types';
 import { generateManifest } from './lib/manifestGenerator';
-import { buildApplyTestRun, buildCsiTemplatePreview, buildLivePreview, buildVClusterPlan, validateKubernetesManifest } from './lib/clusterWorkflow';
+import { buildApplyTestRun, buildCsiTemplatePreview, buildLivePreview, buildNexusClusterOperationBundle, buildVClusterPlan, validateKubernetesManifest } from './lib/clusterWorkflow';
+import { buildDefaultMachineConfig, buildHarvesterMachineInstallPlan } from './lib/harvesterMachineWizard';
 import { isDemoLogin } from './lib/auth';
 import { ClusterIntegrationPanel } from './components/ClusterIntegrationPanel';
 import { LaunchSequence } from './components/LaunchSequence';
 import { LoginScreen } from './components/LoginScreen';
 import { HudDashboard } from './components/HudDashboard';
+import { NexusMachineWizard } from './components/NexusMachineWizard';
 import { Wizard } from './components/Wizard';
 import { YamlEditor } from './components/YamlEditor';
 
@@ -29,6 +31,7 @@ function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLaunching, setIsLaunching] = useState(false);
   const [config, setConfig] = useState<ApplicationConfig>(defaultConfig);
+  const [machineConfig, setMachineConfig] = useState(buildDefaultMachineConfig);
   const [step, setStep] = useState(1);
   const [editedYaml, setEditedYaml] = useState('');
 
@@ -39,6 +42,8 @@ function App() {
   const applyRun = useMemo(() => buildApplyTestRun(displayedManifest, config), [displayedManifest, config]);
   const vclusterPlan = useMemo(() => buildVClusterPlan(config), [config]);
   const csiPreview = useMemo(() => buildCsiTemplatePreview(config.storage), [config.storage]);
+  const operationBundle = useMemo(() => buildNexusClusterOperationBundle(displayedManifest, config), [displayedManifest, config]);
+  const machinePlan = useMemo(() => buildHarvesterMachineInstallPlan(machineConfig), [machineConfig]);
 
   if (isLaunching) {
     return <LaunchSequence />;
@@ -108,8 +113,10 @@ function App() {
           applyRun={applyRun}
           vclusterPlan={vclusterPlan}
           csiPreview={csiPreview}
+          operationBundle={operationBundle}
           config={config}
         />
+        <NexusMachineWizard config={machineConfig} plan={machinePlan} onChange={setMachineConfig} />
         <Wizard currentStep={step} config={config} onChange={setConfig} onNext={() => setStep(Math.min(step + 1, 7))} onBack={() => setStep(Math.max(step - 1, 1))} />
         <section className="manifest-panel">
           <div className="panel-header">
