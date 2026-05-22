@@ -68,6 +68,12 @@ export function NexusMachineWizard({ config, plan, onChange }: NexusMachineWizar
             Cluster token
             <input value={config.clusterToken} onChange={(event) => onChange({ ...config, clusterToken: event.target.value })} />
           </label>
+          {config.installMode === 'join' && (
+            <label>
+              Existing cluster URL
+              <input value={config.serverUrl || ''} onChange={(event) => onChange({ ...config, serverUrl: event.target.value })} placeholder="https://10.10.40.20:443" />
+            </label>
+          )}
           <div className="grid-2">
             <label>
               DNS servers

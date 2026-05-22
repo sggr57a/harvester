@@ -71,7 +71,7 @@ A pull request can be created from this branch to merge Nexus back into the main
 
 ## Completed next steps
 
-- Kubernetes API validation and live preview are wired through the Nexus cluster operation bundle.
+- Kubernetes validation and live preview now combine local structural prechecks with Nexus live-adapter endpoints and server-side dry-run command generation.
 - Manifest apply / test runner commands are generated for `kubectl auth can-i`, server-side dry-run, diff, apply, and rollout status.
 - Virtual cluster support generates `vcluster` create/connect operations from multi-cluster targets.
 - Editor enhancements are implemented with CodeMirror YAML editing.

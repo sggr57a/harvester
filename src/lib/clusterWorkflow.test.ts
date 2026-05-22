@@ -14,13 +14,29 @@ kind: Deployment
 metadata:
   name: demo-app
   namespace: default
-spec: {}
+spec:
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+    spec:
+      containers:
+        - name: demo-app
+          image: nginx
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: demo-app-pvc
-spec: {}
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
 `;
 
 describe('cluster workflow helpers', () => {
@@ -40,6 +56,18 @@ describe('cluster workflow helpers', () => {
     expect(run.status).toBe('passed');
     expect(run.commands[0]).toContain('kubectl apply --dry-run=server');
     expect(run.checks.every((check) => check.passed)).toBe(true);
+  });
+
+  it('rejects structurally invalid Kubernetes workload specs before live preview', () => {
+    const validation = validateKubernetesManifest(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: broken
+spec: {}
+`);
+
+    expect(validation.valid).toBe(false);
+    expect(validation.issues.map((issue) => issue.message)).toContain('Deployment requires spec.selector and spec.template for server-side dry-run.');
   });
 
   it('builds vcluster and CSI driver previews from application configuration', () => {
@@ -86,5 +114,22 @@ describe('cluster workflow helpers', () => {
     expect(bundle.vclusterCommands[0]).toContain('vcluster create edge-a --namespace edge-a-vcluster');
     expect(bundle.csiSourceFiles).toContain('platform/harvester/deploy/charts/harvester/templates/harvester-storageclass.yaml');
     expect(bundle.validation.valid).toBe(true);
+  });
+
+  it('uses workload-specific completion probes for Job and CronJob apply runs', () => {
+    const jobBundle = buildNexusClusterOperationBundle(manifest, {
+      ...defaultConfig,
+      workloadType: 'Job',
+      appName: 'batch-demo',
+    });
+    const cronJobBundle = buildNexusClusterOperationBundle(manifest, {
+      ...defaultConfig,
+      workloadType: 'CronJob',
+      appName: 'nightly-demo',
+    });
+
+    expect(jobBundle.kubectlCommands).toContain('kubectl wait --for=condition=complete job/batch-demo -n default --timeout=180s');
+    expect(cronJobBundle.kubectlCommands).toContain('kubectl get cronjob/nightly-demo -n default -o yaml');
+    expect(cronJobBundle.kubectlCommands.some((command) => command.includes('rollout status cronjob'))).toBe(false);
   });
 });

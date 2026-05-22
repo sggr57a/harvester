@@ -57,4 +57,23 @@ describe('harvester machine wizard', () => {
       'Cluster token is required for create and join modes.',
     ]);
   });
+
+  it('requires and emits the server URL for join-mode machine installs', () => {
+    const missingServerUrlIssues = validateHarvesterMachineConfig({
+      ...buildDefaultMachineConfig(),
+      installMode: 'join',
+      serverUrl: '',
+    });
+
+    expect(missingServerUrlIssues).toContain('Server URL is required when joining an existing Nexus cluster.');
+
+    const plan = buildHarvesterMachineInstallPlan({
+      ...buildDefaultMachineConfig(),
+      installMode: 'join',
+      serverUrl: 'https://10.10.40.20:443',
+    });
+
+    expect(plan.validationIssues).toEqual([]);
+    expect(plan.configYaml).toContain('server_url: https://10.10.40.20:443');
+  });
 });

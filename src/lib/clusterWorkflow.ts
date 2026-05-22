@@ -136,6 +136,7 @@ function parseResources(manifest: string): { resources: ManifestResource[]; issu
     if (kind && !SUPPORTED_KINDS.has(kind)) {
       issues.push({ severity: 'warning', message: `Kind ${kind} is not in the Nexus demo allow-list`, resource: resourceLabel });
     }
+    issues.push(...validateResourceShape(kind, resource, resourceLabel));
 
     if (apiVersion && kind && name) {
       resources.push({ apiVersion, kind, name, namespace });
@@ -143,6 +144,58 @@ function parseResources(manifest: string): { resources: ManifestResource[]; issu
   });
 
   return { resources, issues };
+}
+
+function validateResourceShape(kind: string, resource: Record<string, unknown>, resourceLabel: string): ValidationIssue[] {
+  const issues: ValidationIssue[] = [];
+  const spec = (resource.spec || {}) as Record<string, unknown>;
+
+  if (['Deployment', 'DaemonSet', 'StatefulSet'].includes(kind)) {
+    const template = spec.template as Record<string, unknown> | undefined;
+    if (!spec.selector || !template?.spec) {
+      issues.push({
+        severity: 'error',
+        message: `${kind} requires spec.selector and spec.template for server-side dry-run.`,
+        resource: resourceLabel,
+      });
+    }
+  }
+
+  if (kind === 'Job') {
+    const template = spec.template as Record<string, unknown> | undefined;
+    if (!template?.spec) {
+      issues.push({ severity: 'error', message: 'Job requires spec.template for server-side dry-run.', resource: resourceLabel });
+    }
+  }
+
+  if (kind === 'CronJob') {
+    const jobTemplate = spec.jobTemplate as Record<string, unknown> | undefined;
+    if (!spec.schedule || !jobTemplate?.spec) {
+      issues.push({ severity: 'error', message: 'CronJob requires spec.schedule and spec.jobTemplate for server-side dry-run.', resource: resourceLabel });
+    }
+  }
+
+  if (kind === 'PersistentVolumeClaim') {
+    const resources = spec.resources as Record<string, unknown> | undefined;
+    if (!spec.accessModes || !resources?.requests) {
+      issues.push({ severity: 'error', message: 'PersistentVolumeClaim requires spec.accessModes and spec.resources.requests.', resource: resourceLabel });
+    }
+  }
+
+  return issues;
+}
+
+function buildWorkloadCompletionCommand(config: ApplicationConfig, namespace: string): string {
+  const name = config.appName;
+
+  switch (config.workloadType) {
+    case 'Job':
+      return `kubectl wait --for=condition=complete job/${name} -n ${namespace} --timeout=180s`;
+    case 'CronJob':
+      return `kubectl get cronjob/${name} -n ${namespace} -o yaml`;
+    default:
+      return `kubectl rollout status ${config.workloadType.toLowerCase()}/${name} -n ${namespace}`;
+  }
 }
 
 export function validateKubernetesManifest(manifest: string): ValidationResult {
@@ -172,7 +225,7 @@ export function buildApplyTestRun(manifest: string, config: ApplicationConfig): 
     `kubectl apply --dry-run=server -n ${namespace} -f nexus-generated.yaml`,
     `kubectl diff -n ${namespace} -f nexus-generated.yaml`,
     `kubectl apply -n ${namespace} -f nexus-generated.yaml`,
-    `kubectl rollout status ${config.workloadType.toLowerCase()}/${config.appName} -n ${namespace}`,
+    buildWorkloadCompletionCommand(config, namespace),
   ];
   const checks: ApplyCheck[] = [
     {
@@ -188,7 +241,7 @@ export function buildApplyTestRun(manifest: string, config: ApplicationConfig): 
     {
       label: 'Rollout probe',
       passed: validation.resources.some((resource) => resource.kind === config.workloadType),
-      detail: `${config.workloadType}/${config.appName} rollout command generated`,
+      detail: `${config.workloadType}/${config.appName} completion probe generated`,
     },
   ];
 
@@ -297,6 +350,7 @@ export function buildNexusClusterOperationBundle(manifest: string, config: Appli
   const vclusterPlan = buildVClusterPlan(config);
   const namespace = config.namespace || 'default';
   const workloadResource = config.workloadType.toLowerCase();
+  const completionCommand = buildWorkloadCompletionCommand(config, namespace);
 
   return {
     mode: 'live-adapter',
@@ -315,7 +369,7 @@ export function buildNexusClusterOperationBundle(manifest: string, config: Appli
       `kubectl apply --server-side --dry-run=server -n ${namespace} -f nexus-generated.yaml`,
       `kubectl diff -n ${namespace} -f nexus-generated.yaml`,
       `kubectl apply --server-side -n ${namespace} -f nexus-generated.yaml`,
-      `kubectl rollout status ${workloadResource}/${config.appName} -n ${namespace}`,
+      completionCommand,
     ],
     vclusterCommands: vclusterPlan.commands,
     csiSourceFiles: [

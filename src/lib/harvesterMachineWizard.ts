@@ -11,6 +11,7 @@ export interface HarvesterMachineConfig {
   managementInterface: string;
   vipMode: HarvesterVipMode;
   virtualIp: string;
+  serverUrl?: string;
   clusterToken: string;
   dnsServers: string[];
   ntpServers: string[];
@@ -67,6 +68,9 @@ export function validateHarvesterMachineConfig(config: HarvesterMachineConfig): 
   }
   if (config.installMode !== 'binaries' && !config.clusterToken.trim()) {
     issues.push('Cluster token is required for create and join modes.');
+  }
+  if (config.installMode === 'join' && !config.serverUrl?.trim()) {
+    issues.push('Server URL is required when joining an existing Nexus cluster.');
   }
 
   return issues;
@@ -126,6 +130,7 @@ export function buildHarvesterMachineInstallPlan(config: HarvesterMachineConfig)
   const configDocument = {
     scheme_version: 1,
     token: config.clusterToken || undefined,
+    server_url: config.installMode === 'join' ? config.serverUrl : undefined,
     os: {
       hostname: config.hostName,
       ssh_authorized_keys_url: config.sshKeysUrl || undefined,
