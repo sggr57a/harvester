@@ -62,6 +62,23 @@ metadata:
     expect(validation.issues).toEqual([]);
   });
 
+  it('keeps warning for unknown non-trigger resources with trigger in the name', () => {
+    const validation = validateKubernetesManifest(`apiVersion: example.com/v1
+kind: ReTriggerableWidget
+metadata:
+  name: unknown-widget
+`);
+
+    expect(validation.valid).toBe(true);
+    expect(validation.issues).toEqual([
+      {
+        severity: 'warning',
+        message: 'Kind ReTriggerableWidget is not in the Nexus demo allow-list',
+        resource: 'ReTriggerableWidget/unknown-widget',
+      },
+    ]);
+  });
+
   it('builds a kubectl dry-run/apply test run with commands and successful checks', () => {
     const run = buildApplyTestRun(manifest, defaultConfig);
 
