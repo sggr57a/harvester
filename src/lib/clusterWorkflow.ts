@@ -87,10 +87,18 @@ const SUPPORTED_KINDS = new Set([
   'StorageClass',
 ]);
 
-const TRIGGER_EVENT_KINDS = new Set(['EventListener', 'EventSource', 'Sensor']);
+const TRIGGER_KINDS = new Set([
+  'ClusterTriggerBinding',
+  'EventListener',
+  'EventSource',
+  'Sensor',
+  'Trigger',
+  'TriggerBinding',
+  'TriggerTemplate',
+]);
 
 function isSupportedKind(kind: string): boolean {
-  return SUPPORTED_KINDS.has(kind) || kind.toLowerCase().includes('trigger') || TRIGGER_EVENT_KINDS.has(kind);
+  return SUPPORTED_KINDS.has(kind) || TRIGGER_KINDS.has(kind);
 }
 
 function parseResources(manifest: string): { resources: ManifestResource[]; issues: ValidationIssue[] } {
