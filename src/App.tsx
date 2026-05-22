@@ -4,6 +4,7 @@ import { generateManifest } from './lib/manifestGenerator';
 import { buildApplyTestRun, buildCsiTemplatePreview, buildLivePreview, buildVClusterPlan, validateKubernetesManifest } from './lib/clusterWorkflow';
 import { isDemoLogin } from './lib/auth';
 import { ClusterIntegrationPanel } from './components/ClusterIntegrationPanel';
+import { LaunchSequence } from './components/LaunchSequence';
 import { LoginScreen } from './components/LoginScreen';
 import { HudDashboard } from './components/HudDashboard';
 import { Wizard } from './components/Wizard';
@@ -26,6 +27,7 @@ const STORAGE_TEMPLATES: Record<StorageType, string> = {
 
 function App() {
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [isLaunching, setIsLaunching] = useState(false);
   const [config, setConfig] = useState<ApplicationConfig>(defaultConfig);
   const [step, setStep] = useState(1);
   const [editedYaml, setEditedYaml] = useState('');
@@ -38,12 +40,22 @@ function App() {
   const vclusterPlan = useMemo(() => buildVClusterPlan(config), [config]);
   const csiPreview = useMemo(() => buildCsiTemplatePreview(config.storage), [config.storage]);
 
+  if (isLaunching) {
+    return <LaunchSequence />;
+  }
+
   if (!isAuthenticated) {
     return (
       <LoginScreen
         onLogin={(username, password) => {
           const loginAccepted = isDemoLogin(username, password);
-          setIsAuthenticated(loginAccepted);
+          if (loginAccepted) {
+            setIsLaunching(true);
+            window.setTimeout(() => {
+              setIsAuthenticated(true);
+              setIsLaunching(false);
+            }, 3200);
+          }
           return loginAccepted;
         }}
       />

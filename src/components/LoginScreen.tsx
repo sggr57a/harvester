@@ -29,41 +29,41 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
     <div className="login-screen">
       <div className="login-container">
         <div className="login-header">
-          <div className="login-logo">
-            <div className="logo-icon">🚀</div>
-            <h1>Harvester</h1>
+          <div className="elevate-wordmark" aria-label="Elevate">
+            {'ELEVATE'.split('').map((letter, index) => (
+              <span key={`${letter}-${index}`}>{letter}</span>
+            ))}
           </div>
-          <h2>Workload Wizard</h2>
-          <p>Advanced Kubernetes workload and storage management</p>
+          <div className="elevate-underlight" />
         </div>
 
         <form className="login-form" onSubmit={handleSubmit}>
-          <div className="form-group">
-            <label htmlFor="username">Username</label>
+          <div className="form-group elevate-field">
             <input
               id="username"
               type="text"
+              aria-label="Username"
               value={username}
               onChange={(e) => {
                 setUsername(e.target.value);
                 setError('');
               }}
-              placeholder="Enter your username"
+              placeholder="USER"
               required
             />
           </div>
 
-          <div className="form-group">
-            <label htmlFor="password">Password</label>
+          <div className="form-group elevate-field">
             <input
               id="password"
               type="password"
+              aria-label="Password"
               value={password}
               onChange={(e) => {
                 setPassword(e.target.value);
                 setError('');
               }}
-              placeholder="Enter your password"
+              placeholder="PASSWORD"
               required
             />
           </div>
@@ -78,33 +78,13 @@ export function LoginScreen({ onLogin }: LoginScreenProps) {
             {isLoading ? (
               <>
                 <div className="spinner-small"></div>
-                Signing In...
+                Elevating...
               </>
             ) : (
-              'Sign In'
+              'Enter'
             )}
           </button>
         </form>
-
-        <div className="login-footer">
-          <div className="demo-info">
-            <h3>🎯 Demo Features</h3>
-            <ul>
-              <li>🔐 Secure login system</li>
-              <li>⚙️ Advanced workload configuration</li>
-              <li>💾 Multiple storage backends (Ceph, NFS, SMB, NVMe-oF, RDMA, ZFS)</li>
-              <li>📝 Real-time YAML editing</li>
-              <li>🚀 Automated deployment with storage installation</li>
-              <li>🎨 Dark mode UI with customizable themes</li>
-            </ul>
-          </div>
-
-          <div className="demo-credentials">
-            <p><strong>Demo Credentials:</strong></p>
-            <p>Username: <code>admin</code></p>
-            <p>Password: <code>demo</code></p>
-          </div>
-        </div>
       </div>
     </div>
   );
