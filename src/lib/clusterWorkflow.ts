@@ -60,33 +60,6 @@ export interface CsiTemplatePreview {
   installCommands: string[];
 }
 
-const SUPPORTED_KINDS = new Set([
-  'Application',
-  'CiliumNetworkPolicy',
-  'ConfigMap',
-  'CronJob',
-  'DaemonSet',
-  'Deployment',
-  'FederatedDeployment',
-  'Gateway',
-  'GitRepository',
-  'Ingress',
-  'Job',
-  'Kustomization',
-  'LinkerdServiceProfile',
-  'NetworkPolicy',
-  'PersistentVolumeClaim',
-  'PipelineActivity',
-  'Role',
-  'RoleBinding',
-  'Secret',
-  'Service',
-  'ServiceAccount',
-  'ServiceMonitor',
-  'StatefulSet',
-  'StorageClass',
-]);
-
 function parseResources(manifest: string): { resources: ManifestResource[]; issues: ValidationIssue[] } {
   const issues: ValidationIssue[] = [];
   const resources: ManifestResource[] = [];
@@ -120,9 +93,6 @@ function parseResources(manifest: string): { resources: ManifestResource[]; issu
     }
     if (!name) {
       issues.push({ severity: 'error', message: 'Missing metadata.name', resource: resourceLabel });
-    }
-    if (kind && !SUPPORTED_KINDS.has(kind)) {
-      issues.push({ severity: 'warning', message: `Kind ${kind} is not in the Nexus demo allow-list`, resource: resourceLabel });
     }
 
     if (apiVersion && kind && name) {
