@@ -33,6 +33,28 @@ describe('cluster workflow helpers', () => {
     expect(preview.resources.map((resource) => resource.kind)).toEqual(['Deployment', 'PersistentVolumeClaim']);
   });
 
+  it('allows trigger resources without demo allow-list warnings', () => {
+    const triggerManifest = `apiVersion: triggers.tekton.dev/v1beta1
+kind: Trigger
+metadata:
+  name: nexus-trigger
+spec: {}
+`;
+
+    const validation = validateKubernetesManifest(triggerManifest);
+
+    expect(validation.valid).toBe(true);
+    expect(validation.resources).toEqual([
+      {
+        apiVersion: 'triggers.tekton.dev/v1beta1',
+        kind: 'Trigger',
+        name: 'nexus-trigger',
+        namespace: 'default',
+      },
+    ]);
+    expect(validation.issues).toEqual([]);
+  });
+
   it('builds a kubectl dry-run/apply test run with commands and successful checks', () => {
     const run = buildApplyTestRun(manifest, defaultConfig);
 
