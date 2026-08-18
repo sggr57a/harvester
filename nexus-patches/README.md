@@ -20,12 +20,12 @@ git am 000*.patch
 
 npm install
 npx tsc --noEmit     # clean
-npm run test         # 328 passing (was 291)
+npm run test         # 346 passing (was 328 after the first six; 291 on unpatched main)
 npm run build        # succeeds
 ```
 
 Verified end to end in a fresh clone of `harvester-nexus` at `main` (`1b865a8a`):
-all six patches apply cleanly with `git am`, `tsc --noEmit` is clean, 328 tests
+all nine patches apply cleanly with `git am`, `tsc --noEmit` is clean, 346 tests
 pass, and the production build succeeds.
 
 ## What each patch does
@@ -138,21 +138,48 @@ which is wrong and actively misleading for anyone working on the repo. It also
 listed three themes that no longer exist, claimed 41 tests, and documented the
 wrong credentials.
 
+### 0007 — `feat(xdr)`: ingest Falco / Tetragon / Suricata / Wazuh alerts
+
+The cockpit counted sensor pods but only ingested Kubernetes `Warning` events,
+every one hardcoded to `sensorSeverity: 'medium'`. Adds `xdr_ingest.py` which
+parses Falco JSON, Tetragon `process_exec`/`process_kprobe`, Suricata `eve`
+alerts, and Wazuh `alerts.json`, keeping the severity the sensor assigned
+(Falco priority, Suricata 1–3, Wazuh rule level). Kubernetes warnings still
+appear, but severity is derived from the reason (`OOMKilling` → high,
+`BackOff` → medium, `Pulling` → low).
+
+Verified against a live k3s cluster with four log-emitting sensor pods: the
+collector returned Falco `critical`, Suricata `high`, Tetragon `medium`, and
+Wazuh `info` in one poll — four distinct severities, not a wall of medium.
+
+### 0008 — `feat(telemetry)`: Oscilloscope / FftBars plot measured series
+
+`Oscilloscope` and `FftBars` generated `Math.sin` + `Math.random()` traces and
+labelled them CH1/CH2/CH3 even in live mode. They now follow the snapshot's
+CPU, DRAM, and NIC RX series (or render `—` when a metric is in
+`unavailableMetrics`). The FFT is a deterministic DFT of those same samples.
+Live Mission Control mounts both widgets so the CH1/CH2/CH3 readouts are
+real measurements.
+
+### 0009 — `feat(console)`: KubeVirt VNC/serial websocket proxy
+
+Live consoles stopped at `src/lib/demoConsole.ts`. The cockpit now upgrades
+`/api/v1/console/{vnc,serial,exec}` (session-authenticated) and proxies to the
+KubeVirt subresource API (`…/virtualmachineinstances/{name}/vnc` or
+`/console`) or `kubectl exec` for pods. Names are DNS-1123-validated so a
+console URL cannot smuggle flags. The SPA uses noVNC for graphical attach and
+xterm.js on the same websocket for serial/exec. Demo mode is unchanged.
+
 ## Still outstanding
 
 Not addressed by these patches:
 
-- **XDR ingests only Kubernetes events.** `_xdr_sensor_health` counts running
-  pods; the deployed Falco / Tetragon / Suricata / Wazuh alert streams are never
-  collected, and every ingested event is hardcoded to `sensorSeverity: 'medium'`.
-- **Decorative widgets still synthesise data in live mode.** `Oscilloscope` and
-  `FftBars` in `src/components/dashboards/Widgets.tsx` generate waveforms from
-  `Math.sin` plus `Math.random()` and render "CH1/CH2/CH3" numeric readouts.
-- **Consoles are demo-only** (`src/lib/demoConsole.ts`); no real VNC/serial
-  attach via KubeVirt.
-- **`AGENTS.md` is stale**: it claims "no backend — all data is mock", lists
-  three themes that no longer exist, says 41 tests, and documents the wrong
-  password.
+- **KubeVirt itself is not installed in the verification VM**, so the VNC/
+  serial proxy is covered by handshake, path, and frame-roundtrip tests plus
+  a live `kubectl exec` path. End-to-end RFB against a running VMI needs a
+  node with `/dev/kvm` and the KubeVirt operator.
+- **`lvcreate` for AnyRAID** is still unverified on kernels without
+  device-mapper (see 0005).
 
 ## Reproducing the live-cluster verification
 
