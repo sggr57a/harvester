@@ -1,0 +1,593 @@
+From 89309a544c85c27dc8dcc7ef7767f6f170e2d533 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 18 Aug 2026 19:19:09 +0000
+Subject: [PATCH 4/4] test: cover nullable metrics and cockpit auth invariants
+
+Make the null-vs-zero distinction explicit in the type system: metrics the
+node cannot measure are typed MaybeMetric and recorded in
+snapshot.unavailableMetrics, so a coerced 0 can never be mistaken for a
+measurement. Deltas are suppressed when a metric is unavailable on either
+tick, since 0 - 400 would otherwise imply a 400 W drop that was never
+observed.
+
+Adds 21 tests: adapter behaviour including measured-zero versus
+unmeasurable, and cockpit_auth contract tests asserting salted PBKDF2, no
+plaintext at rest, no hardcoded default password, session expiry and
+revocation, lockout, and strict Bearer/cookie parsing.
+---
+ installer/tests/cockpit-auth.test.ts         | 269 +++++++++++++++++++
+ src/lib/liveTelemetry.ts                     |   9 +
+ src/lib/telemetry/environmentAdapter.test.ts | 101 +++++++
+ src/lib/telemetry/environmentAdapter.ts      |  82 ++++--
+ src/lib/telemetry/types.ts                   |  27 +-
+ 5 files changed, 464 insertions(+), 24 deletions(-)
+ create mode 100644 installer/tests/cockpit-auth.test.ts
+ create mode 100644 src/lib/telemetry/environmentAdapter.test.ts
+
+diff --git a/installer/tests/cockpit-auth.test.ts b/installer/tests/cockpit-auth.test.ts
+new file mode 100644
+index 000000000..b1d7f4b59
+--- /dev/null
++++ b/installer/tests/cockpit-auth.test.ts
+@@ -0,0 +1,269 @@
++/**
++ * Contract tests for installer/overlay/usr/lib/nexus/cockpit_auth.py.
++ *
++ * The cockpit BFF exposes kubectl apply with the node kubeconfig, so these
++ * guarantees are security-critical: no hardcoded default password, hashes that
++ * are salted and not reversible, constant-time verification, and sessions that
++ * cannot be forged.
++ */
++
++import { execFileSync } from 'node:child_process';
++import { mkdtempSync, rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join, resolve } from 'node:path';
++import { afterAll, describe, expect, it } from 'vitest';
++
++const AUTH_MODULE = resolve(__dirname, '../overlay/usr/lib/nexus/cockpit_auth.py');
++const workdir = mkdtempSync(join(tmpdir(), 'nexus-auth-'));
++
++afterAll(() => rmSync(workdir, { recursive: true, force: true }));
++
++/** Run a Python snippet with cockpit_auth imported as `a`; return parsed JSON. */
++function py<T = unknown>(snippet: string, env: Record<string, string> = {}): T {
++  const script = [
++    'import importlib.util, json, sys',
++    `spec = importlib.util.spec_from_file_location("a", ${JSON.stringify(AUTH_MODULE)})`,
++    'a = importlib.util.module_from_spec(spec)',
++    'spec.loader.exec_module(a)',
++    snippet,
++  ].join('\n');
++  const out = execFileSync('python3', ['-c', script], {
++    encoding: 'utf-8',
++    env: { ...process.env, ...env },
++  });
++  return JSON.parse(out) as T;
++}
++
++describe('password hashing', () => {
++  it('salts hashes so identical passwords differ on disk', () => {
++    const result = py<{ same: boolean; algo: string; iterations: number }>(
++      [
++        'h1 = a.hash_password("correct horse battery staple")',
++        'h2 = a.hash_password("correct horse battery staple")',
++        'print(json.dumps({"same": h1["hash"] == h2["hash"], "algo": h1["algorithm"], "iterations": h1["iterations"]}))',
++      ].join('\n'),
++    );
++    expect(result.same).toBe(false);
++    expect(result.algo).toBe('pbkdf2-sha256');
++    expect(result.iterations).toBeGreaterThanOrEqual(600_000);
++  });
++
++  it('never stores the plaintext password', () => {
++    const result = py<{ leaked: boolean }>(
++      [
++        'secret = "super-secret-value"',
++        'rec = a.hash_password(secret)',
++        'print(json.dumps({"leaked": secret in json.dumps(rec)}))',
++      ].join('\n'),
++    );
++    expect(result.leaked).toBe(false);
++  });
++
++  it('accepts the right password and rejects near misses', () => {
++    const result = py<{ ok: boolean; wrong: boolean; empty: boolean; caseChanged: boolean }>(
++      [
++        'rec = a.hash_password("Tr0ub4dor&3")',
++        'print(json.dumps({',
++        '  "ok": a.verify_password("Tr0ub4dor&3", rec),',
++        '  "wrong": a.verify_password("Tr0ub4dor&4", rec),',
++        '  "empty": a.verify_password("", rec),',
++        '  "caseChanged": a.verify_password("tr0ub4dor&3", rec),',
++        '}))',
++      ].join('\n'),
++    );
++    expect(result.ok).toBe(true);
++    expect(result.wrong).toBe(false);
++    expect(result.empty).toBe(false);
++    expect(result.caseChanged).toBe(false);
++  });
++
++  it('rejects malformed credential records instead of raising', () => {
++    const result = py<{ results: boolean[] }>(
++      [
++        'bad = [{}, {"salt": "!!!", "hash": "!!!"}, {"salt": "AAAA"}, None]',
++        'out = []',
++        'for rec in bad:',
++        '    try:',
++        '        out.append(a.verify_password("x", rec or {}))',
++        '    except Exception:',
++        '        out.append(True)  # raising is a failure for this test',
++        'print(json.dumps({"results": out}))',
++      ].join('\n'),
++    );
++    expect(result.results.every((r) => r === false)).toBe(true);
++  });
++});
++
++describe('credential provisioning', () => {
++  it('generates a random password rather than shipping a known default', () => {
++    const authFile = join(workdir, 'a1.json');
++    const pwFile = join(workdir, 'p1');
++    const result = py<{ generated: string; mustChange: boolean; username: string }>(
++      [
++        'store = a.CredentialStore()',
++        'rec, generated = a.ensure_credential_store(store)',
++        'print(json.dumps({"generated": generated or "", "mustChange": rec["mustChangePassword"], "username": rec["username"]}))',
++      ].join('\n'),
++      { NEXUS_COCKPIT_AUTH_FILE: authFile, NEXUS_COCKPIT_PASSWORD_FILE: pwFile },
++    );
++
++    expect(result.username).toBe('admin');
++    expect(result.mustChange).toBe(true);
++    expect(result.generated.length).toBeGreaterThanOrEqual(20);
++    // Regression guard: these were the previously shipped defaults.
++    expect(['admin', 'demo', 'password', '']).not.toContain(result.generated);
++  });
++
++  it('does not regenerate a password once provisioned', () => {
++    const authFile = join(workdir, 'a2.json');
++    const pwFile = join(workdir, 'p2');
++    const env = { NEXUS_COCKPIT_AUTH_FILE: authFile, NEXUS_COCKPIT_PASSWORD_FILE: pwFile };
++    const first = py<{ generated: string }>(
++      [
++        'rec, generated = a.ensure_credential_store(a.CredentialStore())',
++        'print(json.dumps({"generated": generated or ""}))',
++      ].join('\n'),
++      env,
++    );
++    const second = py<{ generated: string }>(
++      [
++        'rec, generated = a.ensure_credential_store(a.CredentialStore())',
++        'print(json.dumps({"generated": generated or ""}))',
++      ].join('\n'),
++      env,
++    );
++    expect(first.generated).not.toBe('');
++    expect(second.generated).toBe('');
++  });
++
++  it('clears the rotation flag when the password is changed', () => {
++    const authFile = join(workdir, 'a3.json');
++    const result = py<{ before: boolean; after: boolean; verifies: boolean }>(
++      [
++        'store = a.CredentialStore()',
++        'rec, _ = a.ensure_credential_store(store)',
++        'before = rec["mustChangePassword"]',
++        'store.set_password("admin", "a-much-longer-password", must_change=False)',
++        'rec2 = store.load()',
++        'print(json.dumps({',
++        '  "before": before,',
++        '  "after": rec2["mustChangePassword"],',
++        '  "verifies": a.verify_password("a-much-longer-password", rec2["credential"]),',
++        '}))',
++      ].join('\n'),
++      { NEXUS_COCKPIT_AUTH_FILE: authFile, NEXUS_COCKPIT_PASSWORD_FILE: join(workdir, 'p3') },
++    );
++    expect(result.before).toBe(true);
++    expect(result.after).toBe(false);
++    expect(result.verifies).toBe(true);
++  });
++});
++
++describe('sessions', () => {
++  it('issues opaque tokens that validate, and rejects forgeries', () => {
++    const result = py<{ user: string; bogus: unknown; len: number }>(
++      [
++        'm = a.SessionManager()',
++        's = m.create("admin")',
++        'print(json.dumps({',
++        '  "user": m.validate(s["token"]),',
++        '  "bogus": m.validate("not-a-token"),',
++        '  "len": len(s["token"]),',
++        '}))',
++      ].join('\n'),
++    );
++    expect(result.user).toBe('admin');
++    expect(result.bogus).toBeNull();
++    expect(result.len).toBeGreaterThanOrEqual(32);
++  });
++
++  it('expires sessions once the TTL elapses', () => {
++    const result = py<{ before: string; after: unknown }>(
++      [
++        'm = a.SessionManager(ttl_seconds=-1)',
++        's = m.create("admin")',
++        'after = m.validate(s["token"])',
++        'm2 = a.SessionManager(ttl_seconds=60)',
++        's2 = m2.create("admin")',
++        'print(json.dumps({"before": m2.validate(s2["token"]), "after": after}))',
++      ].join('\n'),
++    );
++    expect(result.before).toBe('admin');
++    expect(result.after).toBeNull();
++  });
++
++  it('revokes a single session and revokes all on demand', () => {
++    const result = py<{ revoked: unknown; otherAfterAll: unknown }>(
++      [
++        'm = a.SessionManager()',
++        's1 = m.create("admin")',
++        's2 = m.create("admin")',
++        'm.revoke(s1["token"])',
++        'revoked = m.validate(s1["token"])',
++        'm.revoke_all()',
++        'print(json.dumps({"revoked": revoked, "otherAfterAll": m.validate(s2["token"])}))',
++      ].join('\n'),
++    );
++    expect(result.revoked).toBeNull();
++    expect(result.otherAfterAll).toBeNull();
++  });
++
++  it('locks an account out after repeated failures', () => {
++    const result = py<{ before: boolean; after: boolean; cleared: boolean }>(
++      [
++        'm = a.SessionManager()',
++        'before = m.locked_out("admin")',
++        'for _ in range(a.MAX_FAILED_ATTEMPTS):',
++        '    m.record_failure("admin")',
++        'after = m.locked_out("admin")',
++        'm.clear_failures("admin")',
++        'print(json.dumps({"before": before, "after": after, "cleared": m.locked_out("admin")}))',
++      ].join('\n'),
++    );
++    expect(result.before).toBe(false);
++    expect(result.after).toBe(true);
++    expect(result.cleared).toBe(false);
++  });
++});
++
++describe('token parsing', () => {
++  it('parses only well-formed Bearer headers', () => {
++    const result = py<Record<string, unknown>>(
++      [
++        'print(json.dumps({',
++        '  "ok": a.parse_bearer_token("Bearer abc123"),',
++        '  "lower": a.parse_bearer_token("bearer abc123"),',
++        '  "basic": a.parse_bearer_token("Basic abc123"),',
++        '  "empty": a.parse_bearer_token(""),',
++        '  "none": a.parse_bearer_token(None),',
++        '  "noValue": a.parse_bearer_token("Bearer "),',
++        '}))',
++      ].join('\n'),
++    );
++    expect(result.ok).toBe('abc123');
++    expect(result.lower).toBe('abc123');
++    expect(result.basic).toBeNull();
++    expect(result.empty).toBeNull();
++    expect(result.none).toBeNull();
++    expect(result.noValue).toBeNull();
++  });
++
++  it('extracts the session cookie without matching similarly named keys', () => {
++    const result = py<Record<string, unknown>>(
++      [
++        'print(json.dumps({',
++        '  "only": a.parse_session_cookie("nexus_session=tok1"),',
++        '  "among": a.parse_session_cookie("theme=dark; nexus_session=tok2; other=x"),',
++        '  "absent": a.parse_session_cookie("theme=dark"),',
++        '  "similar": a.parse_session_cookie("xnexus_session=nope"),',
++        '  "none": a.parse_session_cookie(None),',
++        '}))',
++      ].join('\n'),
++    );
++    expect(result.only).toBe('tok1');
++    expect(result.among).toBe('tok2');
++    expect(result.absent).toBeNull();
++    expect(result.similar).toBeNull();
++    expect(result.none).toBeNull();
++  });
++});
+diff --git a/src/lib/liveTelemetry.ts b/src/lib/liveTelemetry.ts
+index 3d78e4705..e09b74d04 100644
+--- a/src/lib/liveTelemetry.ts
++++ b/src/lib/liveTelemetry.ts
+@@ -21,6 +21,15 @@ export interface EnvironmentSnapshot {
+   openCves: number;
+   /** Cluster trust score 0-100; security posture metric */
+   trustScore: number;
++  /**
++   * Metrics the node could not measure on this tick. Numeric fields are still
++   * populated (with 0) so existing chart maths keep working, but anything
++   * listed here must render as "unavailable" rather than as a real reading.
++   * Empty or absent in demo mode, where every value is synthetic by design.
++   */
++  unavailableMetrics?: string[];
++  /** Per-metric provenance from the BFF, e.g. `{ cpu: 'metrics-server' }`. */
++  metricSources?: Record<string, string>;
+   /** Rolling deltas vs previous tick (positive or negative) */
+   deltas: {
+     totalWorkloads: number;
+diff --git a/src/lib/telemetry/environmentAdapter.test.ts b/src/lib/telemetry/environmentAdapter.test.ts
+new file mode 100644
+index 000000000..8a80f3a72
+--- /dev/null
++++ b/src/lib/telemetry/environmentAdapter.test.ts
+@@ -0,0 +1,101 @@
++import { describe, expect, it } from 'vitest';
++import {
++  formatMetric,
++  isMetricUnavailable,
++  payloadToEnvironmentSnapshot,
++} from './environmentAdapter';
++import type { EnvironmentTelemetryPayload } from './types';
++
++function payload(overrides: Partial<EnvironmentTelemetryPayload> = {}): EnvironmentTelemetryPayload {
++  return {
++    totalWorkloads: 4,
++    totalIops: 1200,
++    ingressMbps: 40,
++    egressMbps: 30,
++    cpuPercent: 22,
++    ramPercent: 51,
++    watts: 410,
++    activeMigrations: 0,
++    openCves: 3,
++    trustScore: 88,
++    tick: 1,
++    source: 'metrics-server',
++    clusterReady: true,
++    monitoringEnabled: true,
++    nodeCount: 3,
++    podCount: 4,
++    vmCount: 0,
++    ...overrides,
++  };
++}
++
++describe('payloadToEnvironmentSnapshot', () => {
++  it('passes real measurements through untouched', () => {
++    const snap = payloadToEnvironmentSnapshot(payload());
++    expect(snap.cpuPercent).toBe(22);
++    expect(snap.watts).toBe(410);
++    expect(snap.trustScore).toBe(88);
++    expect(snap.unavailableMetrics).toEqual([]);
++  });
++
++  it('records null metrics as unavailable rather than silently reporting 0', () => {
++    const snap = payloadToEnvironmentSnapshot(
++      payload({ watts: null, cpuPercent: null, trustScore: null }),
++    );
++    expect(snap.unavailableMetrics).toEqual(
++      expect.arrayContaining(['watts', 'cpuPercent', 'trustScore']),
++    );
++    expect(isMetricUnavailable(snap, 'watts')).toBe(true);
++    expect(isMetricUnavailable(snap, 'ramPercent')).toBe(false);
++  });
++
++  it('distinguishes a measured zero from an unmeasurable metric', () => {
++    const measuredZero = payloadToEnvironmentSnapshot(payload({ totalIops: 0 }));
++    const unmeasurable = payloadToEnvironmentSnapshot(payload({ totalIops: null }));
++
++    // Both carry 0 numerically, but only one is a real reading.
++    expect(measuredZero.totalIops).toBe(0);
++    expect(unmeasurable.totalIops).toBe(0);
++    expect(isMetricUnavailable(measuredZero, 'totalIops')).toBe(false);
++    expect(isMetricUnavailable(unmeasurable, 'totalIops')).toBe(true);
++  });
++
++  it('suppresses deltas for metrics that are unavailable on either tick', () => {
++    const first = payloadToEnvironmentSnapshot(payload({ watts: 400 }));
++    const second = payloadToEnvironmentSnapshot(payload({ watts: null }), first);
++    // 0 - 400 would imply a 400 W drop that was never measured.
++    expect(second.deltas.watts).toBe(0);
++
++    const third = payloadToEnvironmentSnapshot(payload({ watts: 420 }), second);
++    expect(third.deltas.watts).toBe(0);
++
++    const fourth = payloadToEnvironmentSnapshot(payload({ watts: 450 }), third);
++    expect(fourth.deltas.watts).toBe(30);
++  });
++
++  it('still reports deltas for metrics that remain available', () => {
++    const first = payloadToEnvironmentSnapshot(payload({ cpuPercent: 20 }));
++    const second = payloadToEnvironmentSnapshot(payload({ cpuPercent: 26 }), first);
++    expect(second.deltas.cpuPercent).toBe(6);
++  });
++
++  it('carries per-metric provenance through to the snapshot', () => {
++    const snap = payloadToEnvironmentSnapshot(
++      payload({ metricSources: { cpu: 'metrics-server', watts: 'unavailable' } }),
++    );
++    expect(snap.metricSources?.cpu).toBe('metrics-server');
++  });
++});
++
++describe('formatMetric', () => {
++  it('formats an available metric', () => {
++    const snap = payloadToEnvironmentSnapshot(payload({ watts: 410 }));
++    expect(formatMetric(snap, 'watts', (v) => `${v} W`)).toBe('410 W');
++  });
++
++  it('renders a placeholder instead of a fabricated number', () => {
++    const snap = payloadToEnvironmentSnapshot(payload({ watts: null }));
++    expect(formatMetric(snap, 'watts', (v) => `${v} W`)).toBe('—');
++    expect(formatMetric(undefined, 'watts', (v) => `${v} W`)).toBe('—');
++  });
++});
+diff --git a/src/lib/telemetry/environmentAdapter.ts b/src/lib/telemetry/environmentAdapter.ts
+index 88057a524..d1ccbdc25 100644
+--- a/src/lib/telemetry/environmentAdapter.ts
++++ b/src/lib/telemetry/environmentAdapter.ts
+@@ -1,5 +1,5 @@
+ import type { EnvironmentSnapshot } from '../liveTelemetry';
+-import type { EnvironmentTelemetryPayload } from './types';
++import type { EnvironmentTelemetryPayload, MaybeMetric } from './types';
+ 
+ const ZERO_DELTAS: EnvironmentSnapshot['deltas'] = {
+   totalWorkloads: 0,
+@@ -12,39 +12,91 @@ const ZERO_DELTAS: EnvironmentSnapshot['deltas'] = {
+   activeMigrations: 0,
+ };
+ 
++/** Metrics the BFF may report as null when the underlying source is absent. */
++const NULLABLE_METRICS = [
++  'totalIops',
++  'ingressMbps',
++  'egressMbps',
++  'cpuPercent',
++  'ramPercent',
++  'watts',
++  'openCves',
++  'trustScore',
++] as const satisfies readonly (keyof EnvironmentTelemetryPayload)[];
++
++/**
++ * Substitute 0 so downstream chart arithmetic stays total, while recording the
++ * name so the UI can label it unavailable. Callers must never present a
++ * coerced 0 as a measurement.
++ */
++function coerce(value: MaybeMetric, key: string, unavailable: string[]): number {
++  if (value === null || value === undefined || Number.isNaN(value)) {
++    unavailable.push(key);
++    return 0;
++  }
++  return value;
++}
++
+ export function payloadToEnvironmentSnapshot(
+   payload: EnvironmentTelemetryPayload,
+   previous?: EnvironmentSnapshot,
+ ): EnvironmentSnapshot {
++  const unavailableMetrics: string[] = [];
++  const numeric = Object.fromEntries(
++    NULLABLE_METRICS.map((key) => [key, coerce(payload[key], key, unavailableMetrics)]),
++  ) as Record<(typeof NULLABLE_METRICS)[number], number>;
++
+   const base = {
+     totalWorkloads: payload.totalWorkloads,
+-    totalIops: payload.totalIops,
+-    ingressMbps: payload.ingressMbps,
+-    egressMbps: payload.egressMbps,
+-    cpuPercent: payload.cpuPercent,
+-    ramPercent: payload.ramPercent,
+-    watts: payload.watts,
++    ...numeric,
+     activeMigrations: payload.activeMigrations,
+-    openCves: payload.openCves,
+-    trustScore: payload.trustScore,
+     tick: payload.tick,
++    unavailableMetrics,
++    metricSources: payload.metricSources,
+   };
+ 
+   if (!previous) {
+     return { ...base, deltas: { ...ZERO_DELTAS } };
+   }
+ 
++  // A metric that is unavailable now, or was unavailable last tick, has no
++  // meaningful delta — reporting one would imply a measured change.
++  const delta = (key: keyof EnvironmentSnapshot['deltas'], current: number, prior: number): number => {
++    if (unavailableMetrics.includes(key) || previous.unavailableMetrics?.includes(key)) return 0;
++    return current - prior;
++  };
++
+   return {
+     ...base,
+     deltas: {
+       totalWorkloads: base.totalWorkloads - previous.totalWorkloads,
+-      totalIops: base.totalIops - previous.totalIops,
+-      ingressMbps: base.ingressMbps - previous.ingressMbps,
+-      egressMbps: base.egressMbps - previous.egressMbps,
+-      cpuPercent: base.cpuPercent - previous.cpuPercent,
+-      ramPercent: base.ramPercent - previous.ramPercent,
+-      watts: base.watts - previous.watts,
++      totalIops: delta('totalIops', base.totalIops, previous.totalIops),
++      ingressMbps: delta('ingressMbps', base.ingressMbps, previous.ingressMbps),
++      egressMbps: delta('egressMbps', base.egressMbps, previous.egressMbps),
++      cpuPercent: delta('cpuPercent', base.cpuPercent, previous.cpuPercent),
++      ramPercent: delta('ramPercent', base.ramPercent, previous.ramPercent),
++      watts: delta('watts', base.watts, previous.watts),
+       activeMigrations: base.activeMigrations - previous.activeMigrations,
+     },
+   };
+ }
++
++/** True when `key` was not measurable on the tick that produced `snapshot`. */
++export function isMetricUnavailable(
++  snapshot: EnvironmentSnapshot | undefined,
++  key: string,
++): boolean {
++  return Boolean(snapshot?.unavailableMetrics?.includes(key));
++}
++
++/** Render a metric for display, or a dash when it was not measurable. */
++export function formatMetric(
++  snapshot: EnvironmentSnapshot | undefined,
++  key: keyof EnvironmentSnapshot & string,
++  format: (value: number) => string,
++  placeholder = '—',
++): string {
++  if (!snapshot || isMetricUnavailable(snapshot, key)) return placeholder;
++  const value = snapshot[key];
++  return typeof value === 'number' ? format(value) : placeholder;
++}
+diff --git a/src/lib/telemetry/types.ts b/src/lib/telemetry/types.ts
+index 0eab70506..e05475905 100644
+--- a/src/lib/telemetry/types.ts
++++ b/src/lib/telemetry/types.ts
+@@ -1,22 +1,31 @@
++/**
++ * A metric the node could not measure. The BFF sends `null` rather than a
++ * placeholder number, so `0` always means "measured zero" and never
++ * "no data" — the two must stay distinguishable in the UI.
++ */
++export type MaybeMetric = number | null;
++
+ /** JSON payload from GET /api/v1/telemetry/environment */
+ export interface EnvironmentTelemetryPayload {
+   totalWorkloads: number;
+-  totalIops: number;
+-  ingressMbps: number;
+-  egressMbps: number;
+-  cpuPercent: number;
+-  ramPercent: number;
+-  watts: number;
++  totalIops: MaybeMetric;
++  ingressMbps: MaybeMetric;
++  egressMbps: MaybeMetric;
++  cpuPercent: MaybeMetric;
++  ramPercent: MaybeMetric;
++  watts: MaybeMetric;
+   activeMigrations: number;
+-  openCves: number;
+-  trustScore: number;
++  openCves: MaybeMetric;
++  trustScore: MaybeMetric;
+   tick: number;
+-  source: 'harvester' | 'metrics-server' | 'mixed';
++  source: 'harvester' | 'metrics-server' | 'kube-api' | 'mixed';
+   clusterReady: boolean;
+   monitoringEnabled: boolean;
+   nodeCount: number;
+   podCount: number;
+   vmCount: number;
++  /** Per-metric provenance, e.g. `{ cpu: 'metrics-server', watts: 'unavailable' }`. */
++  metricSources?: Record<string, string>;
+ }
+ 
+ export interface LiveHealthPayload {
+-- 
+2.43.0
+

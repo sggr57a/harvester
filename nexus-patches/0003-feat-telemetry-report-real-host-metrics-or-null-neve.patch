@@ -1,0 +1,575 @@
+From d6b86595c0d5c5474e89afaeb6a07f3527f86c8c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 18 Aug 2026 19:16:07 +0000
+Subject: [PATCH 3/4] feat(telemetry): report real host metrics, or null, never
+ fabricated values
+
+Live mode presented several invented figures as measurements:
+
+- watts was literally node_count * 220.
+- trustScore was a hardcoded 85 that no collector ever wrote.
+- totalIops/ingressMbps/egressMbps were read from a state file only the
+  dashboards endpoint populated, so polling /telemetry/environment alone
+  returned a permanent 0.
+- cpuPercent/ramPercent returned 0.0 when metrics-server was absent,
+  indistinguishable from a genuinely idle cluster.
+- clusterReady matched the pod names rke2-server/rke2-ingress-nginx, so it
+  never became true on K3s even though the installer supports both.
+
+Add host_metrics.py reading real kernel counters: power from Intel RAPL or
+IPMI DCMI, IOPS from /proc/diskstats, throughput from /proc/net/dev, with
+virtual devices excluded and rates differenced across samples. Derive
+openCves/trustScore from Trivy VulnerabilityReports. Base readiness on node
+Ready conditions, which are distribution-agnostic.
+
+Unavailable sources now return null with a reason in metricSources instead
+of a plausible-looking number. Also guard _save_state, which raised
+PermissionError and 503'd the whole endpoint when /var/lib/nexus was not
+writable.
+
+Verified against a live k3s cluster: cpuPercent 5.5 / ramPercent 17.5 match
+'kubectl top nodes' (5% / 17%); totalIops tracked a 400 MB write at 8074
+IOPS; watts stayed null on a VM with no RAPL or BMC.
+---
+ .../overlay/usr/lib/nexus/cluster_metrics.py  | 164 ++++++++--
+ .../overlay/usr/lib/nexus/host_metrics.py     | 292 ++++++++++++++++++
+ 2 files changed, 432 insertions(+), 24 deletions(-)
+ create mode 100644 installer/overlay/usr/lib/nexus/host_metrics.py
+
+diff --git a/installer/overlay/usr/lib/nexus/cluster_metrics.py b/installer/overlay/usr/lib/nexus/cluster_metrics.py
+index a01771b1a..333752917 100644
+--- a/installer/overlay/usr/lib/nexus/cluster_metrics.py
++++ b/installer/overlay/usr/lib/nexus/cluster_metrics.py
+@@ -3,10 +3,12 @@
+ 
+ from __future__ import annotations
+ 
++import importlib.util
+ import json
+ import os
+ import ssl
+ import subprocess
++import sys
+ import urllib.error
+ import urllib.request
+ from typing import Any
+@@ -131,10 +133,16 @@ def _count_active_migrations(kubeconfig: str) -> int:
+     return count
+ 
+ 
+-def _node_capacity_usage(kubeconfig: str) -> tuple[float, float, int]:
++def _node_capacity_usage(kubeconfig: str) -> tuple[float | None, float | None, int]:
++    """Cluster CPU/RAM utilisation, or (None, None) when metrics-server is absent.
++
++    Returning 0.0 for "no data" made the cockpit render a confident 0% CPU on
++    clusters with no metrics pipeline, which is indistinguishable from a genuinely
++    idle cluster.
++    """
+     nodes = _kubectl_json(kubeconfig, "get", "nodes")
+     if not isinstance(nodes, dict):
+-        return 0.0, 0.0, 0
++        return None, None, 0
+ 
+     node_items = nodes.get("items") or []
+     node_count = len(node_items)
+@@ -166,8 +174,13 @@ def _node_capacity_usage(kubeconfig: str) -> tuple[float, float, int]:
+             cpu_used += _parse_cpu_cores(str(usage.get("cpu", "0")))
+             mem_used += _parse_bytes(str(usage.get("memory", "0")))
+ 
+-    cpu_percent = round((cpu_used / cpu_cap) * 100.0, 1) if cpu_cap > 0 else 0.0
+-    ram_percent = round((mem_used / mem_cap) * 100.0, 1) if mem_cap > 0 else 0.0
++    if not usage_by_name:
++        # Capacity is known from the node objects, but utilisation requires the
++        # metrics API. Report unavailable rather than 0%.
++        return None, None, node_count
++
++    cpu_percent = round((cpu_used / cpu_cap) * 100.0, 1) if cpu_cap > 0 else None
++    ram_percent = round((mem_used / mem_cap) * 100.0, 1) if mem_cap > 0 else None
+     return cpu_percent, ram_percent, node_count
+ 
+ 
+@@ -188,14 +201,100 @@ def _monitoring_addon_enabled(kubeconfig: str) -> bool:
+ 
+ 
+ def _harvester_ready(kubeconfig: str) -> bool:
+-    data = _kubectl_json(kubeconfig, "get", "pods", "-n", "kube-system")
+-    if not isinstance(data, dict):
++    """True when every node reports Ready and kube-system has no failed pods.
++
++    The previous implementation matched the pod names ``rke2-server`` and
++    ``rke2-ingress-nginx``, so readiness never became true on a K3s-based
++    cluster even though the installer supports both distributions. Node
++    conditions are distribution-agnostic.
++    """
++    nodes = _kubectl_json(kubeconfig, "get", "nodes")
++    if not isinstance(nodes, dict):
+         return False
+-    names = " ".join(
+-        ((item.get("metadata") or {}).get("name") or "")
+-        for item in (data.get("items") or [])
+-    )
+-    return "rke2-server" in names or "rke2-ingress-nginx" in names
++    node_items = nodes.get("items") or []
++    if not node_items:
++        return False
++    for node in node_items:
++        conditions = (node.get("status") or {}).get("conditions") or []
++        ready = any(
++            c.get("type") == "Ready" and c.get("status") == "True" for c in conditions
++        )
++        if not ready:
++            return False
++
++    pods = _kubectl_json(kubeconfig, "get", "pods", "-n", "kube-system")
++    if not isinstance(pods, dict):
++        return False
++    items = pods.get("items") or []
++    if not items:
++        return False
++    for pod in items:
++        phase = (pod.get("status") or {}).get("phase")
++        if phase in ("Failed", "Unknown"):
++            return False
++    return True
++
++
++def _collect_host_metrics() -> dict[str, Any]:
++    """Real power / disk / network readings, or nulls when unavailable."""
++    try:
++        spec = importlib.util.spec_from_file_location(
++            "nexus_host_metrics", os.path.join(os.path.dirname(__file__), "host_metrics.py")
++        )
++        if spec is None or spec.loader is None:
++            raise ImportError("host_metrics module missing")
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module.collect_host_metrics()
++    except Exception:  # noqa: BLE001
++        return {
++            "watts": None,
++            "totalIops": None,
++            "ingressMbps": None,
++            "egressMbps": None,
++            "sources": {"host": "unavailable (host_metrics failed to load)"},
++        }
++
++
++def _security_posture(kubeconfig: str) -> dict[str, Any]:
++    """Derive CVE count and a trust score from real scanner output.
++
++    ``trustScore`` was previously a hardcoded 85 that nothing ever wrote. It
++    is now computed from Trivy VulnerabilityReports when the operator has
++    deployed them, and is ``None`` otherwise, so the cockpit does not present
++    a constant as a measurement.
++    """
++    reports = _kubectl_json(kubeconfig, "get", "vulnerabilityreports.aquasecurity.github.io", "-A")
++    if not isinstance(reports, dict):
++        return {
++            "openCves": None,
++            "trustScore": None,
++            "source": "unavailable (Trivy VulnerabilityReports not present)",
++        }
++
++    critical = high = medium = low = 0
++    for item in reports.get("items") or []:
++        summary = (item.get("report") or {}).get("summary") or {}
++        critical += int(summary.get("criticalCount", 0) or 0)
++        high += int(summary.get("highCount", 0) or 0)
++        medium += int(summary.get("mediumCount", 0) or 0)
++        low += int(summary.get("lowCount", 0) or 0)
++
++    open_cves = critical + high + medium + low
++    # Weighted deduction, floored at 0: criticals dominate, lows barely move it.
++    penalty = critical * 10 + high * 3 + medium * 0.5 + low * 0.1
++    trust = max(0, min(100, int(round(100 - penalty))))
++    return {
++        "openCves": open_cves,
++        "trustScore": trust,
++        "source": "trivy-operator",
++        "cveBreakdown": {
++            "critical": critical,
++            "high": high,
++            "medium": medium,
++            "low": low,
++        },
++    }
+ 
+ 
+ def _load_state() -> dict[str, Any]:
+@@ -207,11 +306,17 @@ def _load_state() -> dict[str, Any]:
+ 
+ 
+ def _save_state(state: dict[str, Any]) -> None:
+-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+-    tmp = STATE_FILE + ".tmp"
+-    with open(tmp, "w", encoding="utf-8") as fh:
+-        json.dump(state, fh)
+-    os.replace(tmp, STATE_FILE)
++    """Best-effort persist. A non-writable state dir must not 503 the endpoint."""
++    try:
++        directory = os.path.dirname(STATE_FILE)
++        if directory:
++            os.makedirs(directory, exist_ok=True)
++        tmp = STATE_FILE + ".tmp"
++        with open(tmp, "w", encoding="utf-8") as fh:
++            json.dump(state, fh)
++        os.replace(tmp, STATE_FILE)
++    except OSError as exc:
++        sys.stderr.write("nexus-metrics: state persist failed (%s); continuing\n" % exc)
+ 
+ 
+ def collect_environment() -> dict[str, Any]:
+@@ -225,6 +330,8 @@ def collect_environment() -> dict[str, Any]:
+     active_migrations = _count_active_migrations(kubeconfig)
+     monitoring = _monitoring_addon_enabled(kubeconfig)
+     cluster_ready = _harvester_ready(kubeconfig)
++    host = _collect_host_metrics()
++    security = _security_posture(kubeconfig)
+ 
+     state = _load_state()
+     tick = int(state.get("tick", 0)) + 1
+@@ -232,26 +339,35 @@ def collect_environment() -> dict[str, Any]:
+     _save_state(state)
+ 
+     total_workloads = pod_count + vm_count
+-    watts = node_count * 220
+ 
+     return {
+         "totalWorkloads": total_workloads,
+-        "totalIops": int(state.get("totalIops", 0)),
+-        "ingressMbps": int(state.get("ingressMbps", 0)),
+-        "egressMbps": int(state.get("egressMbps", 0)),
++        # Read straight from kernel counters on this node. null means the
++        # source is genuinely unavailable — never substitute a plausible
++        # number, and never depend on another endpoint having run first.
++        "totalIops": host.get("totalIops"),
++        "ingressMbps": host.get("ingressMbps"),
++        "egressMbps": host.get("egressMbps"),
+         "cpuPercent": cpu_percent,
+         "ramPercent": ram_percent,
+-        "watts": watts,
++        "watts": host.get("watts"),
+         "activeMigrations": active_migrations,
+-        "openCves": int(state.get("openCves", 0)),
+-        "trustScore": int(state.get("trustScore", 85)),
++        "openCves": security.get("openCves"),
++        "trustScore": security.get("trustScore"),
+         "tick": tick,
+-        "source": "metrics-server" if cpu_percent > 0 else "harvester",
++        "source": "metrics-server" if cpu_percent is not None else "kube-api",
+         "clusterReady": cluster_ready,
+         "monitoringEnabled": monitoring,
+         "nodeCount": node_count,
+         "podCount": pod_count,
+         "vmCount": vm_count,
++        # Per-metric provenance so the cockpit can label partial coverage
++        # rather than presenting every figure as equally authoritative.
++        "metricSources": {
++            **host.get("sources", {}),
++            "cpu": "metrics-server" if cpu_percent is not None else "unavailable (metrics-server not installed)",
++            "security": security.get("source", "unavailable"),
++        },
+     }
+ 
+ 
+diff --git a/installer/overlay/usr/lib/nexus/host_metrics.py b/installer/overlay/usr/lib/nexus/host_metrics.py
+new file mode 100644
+index 000000000..4df2d15e0
+--- /dev/null
++++ b/installer/overlay/usr/lib/nexus/host_metrics.py
+@@ -0,0 +1,292 @@
++#!/usr/bin/env python3
++"""Real node-local metrics read from kernel counters and platform sensors.
++
++Every function here returns ``None`` when the underlying source is genuinely
++unavailable rather than substituting a plausible-looking number. Callers are
++expected to propagate the ``None`` so the cockpit can render "unavailable"
++instead of a fabricated reading.
++
++Sources, in preference order:
++
++* power   — Intel RAPL (``/sys/class/powercap``), then IPMI DCMI via
++            ``ipmitool``. RAPL measures package/DRAM domains only, so it is
++            reported as a partial figure; IPMI DCMI reports whole-chassis draw.
++* disk    — ``/proc/diskstats`` fields 4 and 8 (completed reads/writes),
++            differenced against the previous sample.
++* network — ``/proc/net/dev`` rx/tx byte counters, differenced likewise.
++
++Rates need two samples, so the first call after boot returns ``None`` for the
++rate metrics and seeds the cache. The cache is best-effort: if it cannot be
++written, rates stay unavailable instead of raising.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import shutil
++import subprocess
++import time
++from typing import Any
++
++SAMPLE_FILE = os.environ.get("NEXUS_HOST_SAMPLE_FILE", "/var/lib/nexus/host-sample.json")
++
++# Virtual and loopback devices would double-count traffic that already
++# traverses a physical NIC, so they are excluded from throughput totals.
++VIRTUAL_NET_PREFIXES = (
++    "lo", "veth", "docker", "flannel", "cni", "cali", "tunl", "kube-ipvs",
++    "dummy", "virbr", "vxlan", "nodelocaldns", "br-", "ovs-", "genev",
++)
++
++# Partitions, loop/ram devices, and device-mapper targets sit on top of the
++# physical block devices we already count.
++VIRTUAL_DISK_PREFIXES = ("loop", "ram", "dm-", "sr", "zram", "md")
++
++
++def _read_first_line(path: str) -> str | None:
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            return fh.readline().strip()
++    except OSError:
++        return None
++
++
++# ---------------------------------------------------------------- power
++
++
++def _rapl_microjoules() -> int | None:
++    """Sum energy counters across all RAPL top-level domains."""
++    base = "/sys/class/powercap"
++    if not os.path.isdir(base):
++        return None
++    total = 0
++    found = False
++    try:
++        entries = sorted(os.listdir(base))
++    except OSError:
++        return None
++    for entry in entries:
++        # Only top-level packages (intel-rapl:N); subdomains double-count.
++        if not entry.startswith("intel-rapl:") or entry.count(":") != 1:
++            continue
++        raw = _read_first_line(os.path.join(base, entry, "energy_uj"))
++        if raw is None:
++            continue
++        try:
++            total += int(raw)
++            found = True
++        except ValueError:
++            continue
++    return total if found else None
++
++
++def _ipmi_watts() -> float | None:
++    """Whole-chassis draw via IPMI DCMI, when a BMC is reachable."""
++    if not shutil.which("ipmitool"):
++        return None
++    try:
++        proc = subprocess.run(
++            ["ipmitool", "dcmi", "power", "reading"],
++            capture_output=True,
++            text=True,
++            timeout=10,
++            check=False,
++        )
++    except (OSError, subprocess.TimeoutExpired):
++        return None
++    if proc.returncode != 0:
++        return None
++    for line in proc.stdout.splitlines():
++        if "Instantaneous power reading" in line:
++            parts = line.split(":", 1)
++            if len(parts) != 2:
++                continue
++            token = parts[1].strip().split()
++            if token:
++                try:
++                    return float(token[0])
++                except ValueError:
++                    return None
++    return None
++
++
++# ---------------------------------------------------------------- disk
++
++
++def _diskstats() -> dict[str, tuple[int, int]] | None:
++    """Return {device: (reads_completed, writes_completed)} for real devices."""
++    try:
++        with open("/proc/diskstats", "r", encoding="utf-8") as fh:
++            lines = fh.readlines()
++    except OSError:
++        return None
++    out: dict[str, tuple[int, int]] = {}
++    for line in lines:
++        fields = line.split()
++        if len(fields) < 8:
++            continue
++        name = fields[2]
++        if name.startswith(VIRTUAL_DISK_PREFIXES):
++            continue
++        # Skip partitions (sda1) in favour of their parent device (sda).
++        if name[-1].isdigit() and not name.startswith("nvme"):
++            continue
++        try:
++            out[name] = (int(fields[3]), int(fields[7]))
++        except ValueError:
++            continue
++    return out or None
++
++
++# ---------------------------------------------------------------- network
++
++
++def _netdev() -> dict[str, tuple[int, int]] | None:
++    """Return {iface: (rx_bytes, tx_bytes)} for physical interfaces."""
++    try:
++        with open("/proc/net/dev", "r", encoding="utf-8") as fh:
++            lines = fh.readlines()[2:]
++    except OSError:
++        return None
++    out: dict[str, tuple[int, int]] = {}
++    for line in lines:
++        name, _, rest = line.partition(":")
++        iface = name.strip()
++        if not iface or iface.startswith(VIRTUAL_NET_PREFIXES):
++            continue
++        fields = rest.split()
++        if len(fields) < 9:
++            continue
++        try:
++            out[iface] = (int(fields[0]), int(fields[8]))
++        except ValueError:
++            continue
++    return out or None
++
++
++# ---------------------------------------------------------------- sampling
++
++
++def _load_sample() -> dict[str, Any]:
++    try:
++        with open(SAMPLE_FILE, "r", encoding="utf-8") as fh:
++            data = json.load(fh)
++        return data if isinstance(data, dict) else {}
++    except (OSError, json.JSONDecodeError):
++        return {}
++
++
++def _save_sample(sample: dict[str, Any]) -> None:
++    """Best-effort persist; a read-only /var must not break metrics."""
++    try:
++        directory = os.path.dirname(SAMPLE_FILE)
++        if directory:
++            os.makedirs(directory, exist_ok=True)
++        tmp = SAMPLE_FILE + ".tmp"
++        with open(tmp, "w", encoding="utf-8") as fh:
++            json.dump(sample, fh)
++        os.replace(tmp, SAMPLE_FILE)
++    except OSError:
++        pass
++
++
++def _rate(current: int, previous: int, seconds: float) -> float | None:
++    """Per-second rate, discarding counter rollovers and device swaps."""
++    if seconds <= 0 or current < previous:
++        return None
++    return (current - previous) / seconds
++
++
++def collect_host_metrics() -> dict[str, Any]:
++    """Sample the host once and return real rates plus availability flags.
++
++    Returns keys ``watts``, ``totalIops``, ``ingressMbps``, ``egressMbps``,
++    each either a number or ``None``, and ``sources`` describing where each
++    figure came from so the UI can be explicit about partial coverage.
++    """
++    now = time.time()
++    previous = _load_sample()
++    prev_time = float(previous.get("timestamp") or 0.0)
++    elapsed = now - prev_time if prev_time else 0.0
++
++    rapl = _rapl_microjoules()
++    disks = _diskstats()
++    nets = _netdev()
++
++    sample: dict[str, Any] = {"timestamp": now}
++    if rapl is not None:
++        sample["raplMicrojoules"] = rapl
++    if disks:
++        sample["disks"] = {k: list(v) for k, v in disks.items()}
++    if nets:
++        sample["nets"] = {k: list(v) for k, v in nets.items()}
++
++    sources: dict[str, str] = {}
++
++    # --- power: prefer whole-chassis IPMI, fall back to partial RAPL ---
++    watts = _ipmi_watts()
++    if watts is not None:
++        sources["watts"] = "ipmi-dcmi"
++    elif rapl is not None and elapsed > 0 and "raplMicrojoules" in previous:
++        delta_uj = rapl - int(previous["raplMicrojoules"])
++        if delta_uj >= 0:
++            watts = round(delta_uj / 1_000_000.0 / elapsed, 1)
++            sources["watts"] = "intel-rapl (package/DRAM domains only)"
++    if watts is None:
++        sources["watts"] = "unavailable"
++
++    # --- disk IOPS ---
++    total_iops: float | None = None
++    if disks and elapsed > 0 and isinstance(previous.get("disks"), dict):
++        accumulated = 0.0
++        matched = False
++        for device, (reads, writes) in disks.items():
++            prev_pair = previous["disks"].get(device)
++            if not isinstance(prev_pair, list) or len(prev_pair) != 2:
++                continue
++            r = _rate(reads, int(prev_pair[0]), elapsed)
++            w = _rate(writes, int(prev_pair[1]), elapsed)
++            if r is None or w is None:
++                continue
++            accumulated += r + w
++            matched = True
++        if matched:
++            total_iops = round(accumulated, 1)
++            sources["totalIops"] = "/proc/diskstats"
++    if total_iops is None:
++        sources["totalIops"] = "unavailable (needs two samples)"
++
++    # --- network throughput ---
++    ingress_mbps: float | None = None
++    egress_mbps: float | None = None
++    if nets and elapsed > 0 and isinstance(previous.get("nets"), dict):
++        rx_total = 0.0
++        tx_total = 0.0
++        matched = False
++        for iface, (rx, tx) in nets.items():
++            prev_pair = previous["nets"].get(iface)
++            if not isinstance(prev_pair, list) or len(prev_pair) != 2:
++                continue
++            rx_rate = _rate(rx, int(prev_pair[0]), elapsed)
++            tx_rate = _rate(tx, int(prev_pair[1]), elapsed)
++            if rx_rate is None or tx_rate is None:
++                continue
++            rx_total += rx_rate
++            tx_total += tx_rate
++            matched = True
++        if matched:
++            ingress_mbps = round(rx_total * 8.0 / 1_000_000.0, 2)
++            egress_mbps = round(tx_total * 8.0 / 1_000_000.0, 2)
++            sources["network"] = "/proc/net/dev"
++    if ingress_mbps is None:
++        sources["network"] = "unavailable (needs two samples)"
++
++    _save_sample(sample)
++
++    return {
++        "watts": watts,
++        "totalIops": total_iops,
++        "ingressMbps": ingress_mbps,
++        "egressMbps": egress_mbps,
++        "sources": sources,
++    }
+-- 
+2.43.0
+
