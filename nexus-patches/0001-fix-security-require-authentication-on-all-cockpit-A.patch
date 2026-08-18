@@ -1,7 +1,7 @@
 From 1c1f42ea0da89fe4787340b3dacc5733a3eca4c0 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 18 Aug 2026 19:11:02 +0000
-Subject: [PATCH 1/4] fix(security): require authentication on all cockpit API
+Subject: [PATCH 1/6] fix(security): require authentication on all cockpit API
  routes
 
 The cockpit BFF served every /api/v1 route without any authentication while

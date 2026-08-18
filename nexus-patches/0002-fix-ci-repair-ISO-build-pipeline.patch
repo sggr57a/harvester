@@ -1,7 +1,7 @@
 From 7cddbf8526056bb4e9b3433151fa79f0ee6ebe38 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 18 Aug 2026 19:12:08 +0000
-Subject: [PATCH 2/4] fix(ci): repair ISO build pipeline
+Subject: [PATCH 2/6] fix(ci): repair ISO build pipeline
 
 The ISO job failed on every recent run on main, so no ISO has been
 published. Three separate faults:

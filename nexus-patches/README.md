@@ -16,16 +16,17 @@ cd harvester-nexus
 git checkout -b cursor/nexus-production-hardening main
 
 # Copy the patch files from this repo, then:
-git am 0001-*.patch 0002-*.patch 0003-*.patch 0004-*.patch
+git am 000*.patch
 
 npm install
 npx tsc --noEmit     # clean
-npm run test         # 312 passing
+npm run test         # 328 passing (was 291)
 npm run build        # succeeds
 ```
 
-Verified to apply cleanly with `git am` against `harvester-nexus` `main` at
-commit `1b865a8a`.
+Verified end to end in a fresh clone of `harvester-nexus` at `main` (`1b865a8a`):
+all six patches apply cleanly with `git am`, `tsc --noEmit` is clean, 328 tests
+pass, and the production build succeeds.
 
 ## What each patch does
 
@@ -97,17 +98,50 @@ Adds 21 tests (291 → 312), including a case asserting that a *measured* zero a
 an *unmeasurable* metric stay distinguishable, and contract tests asserting no
 hardcoded default password and no plaintext at rest.
 
+### 0005 — `feat(storage)`: implement AnyRAID on LVM, remove the phantom CSI driver
+
+`installer/manifests/30-anyraid-csi.yaml` declared a CSIDriver plus a DaemonSet
+running `ghcr.io/sggr57a/nexus-anyraid-csi:1.0.0`. **That image is never built** —
+no source and no build recipe for it exists anywhere in the repo, and the only
+Dockerfile is the ISO builder. On a real install the DaemonSet went to
+`ImagePullBackOff` and every PVC on the `anyraid-default` StorageClass stayed
+`Pending` forever, so AnyRAID was advertised but non-functional.
+
+Implemented over LVM rather than as a new block layer, because LVM already
+provides the primitive AnyRAID describes: a volume group pools physical volumes
+of differing sizes and allocates in fixed-size *extents* (the "slabs"), and its
+RAID targets sit on dm-raid — the same kernel code mdadm drives. Profiles map as
+`mirror→raid1`, `striped-mirror→raid10`, `raidz1→raid5`, `raidz2→raid6`.
+
+`raidz3` is **rejected rather than silently downgraded**: dm-raid has no
+triple-parity target, and quietly delivering two-drive tolerance for a
+three-parity request would misrepresent the redundancy an operator selected.
+
+`plan_pool` reports stranded capacity per drive, because equal-leg layouts are
+bounded by the smallest member and a raw-sum total would over-promise. Device
+paths are validated against a strict pattern and every call uses argument lists,
+so wizard input cannot smuggle flags or escape `/dev`. Pool health is served from
+`GET /api/v1/storage/anyraid` by the cockpit, which already runs on the host,
+instead of by a privileged `hostPID` DaemonSet.
+
+Verified on real heterogeneous loop devices (640M / 640M / 1.12G / 1.94G):
+`pvcreate` and `vgcreate` created a genuine 4-PV volume group, confirmed with
+`pvs`/`vgs`. **`lvcreate` is unverified here** — this container kernel exposes no
+device-mapper target at all (`dmsetup targets` fails), so the RAID LV creation
+path needs a node with dm-raid. Planning, validation, and capacity accounting are
+covered by 16 tests.
+
+### 0006 — `docs`: correct stale AGENTS.md claims
+
+`AGENTS.md` stated "There is no backend — all data is mock/computed locally",
+which is wrong and actively misleading for anyone working on the repo. It also
+listed three themes that no longer exist, claimed 41 tests, and documented the
+wrong credentials.
+
 ## Still outstanding
 
 Not addressed by these patches:
 
-- **AnyRAID does not exist.** There is no source and no build recipe anywhere in
-  the repo, yet `installer/manifests/30-anyraid-csi.yaml` deploys a DaemonSet
-  pulling `ghcr.io/sggr57a/nexus-anyraid-csi:1.0.0`. On a real install that is a
-  guaranteed `ImagePullBackOff`, and any PVC on the `anyraid-default`
-  StorageClass hangs `Pending` forever. Recommendation: implement it over LVM,
-  whose extents already provide slab allocation across heterogeneous drives with
-  RAID levels, rather than writing a new CSI driver from scratch.
 - **XDR ingests only Kubernetes events.** `_xdr_sensor_health` counts running
   pods; the deployed Falco / Tetragon / Suricata / Wazuh alert streams are never
   collected, and every ingested event is hardcoded to `sensorSeverity: 'medium'`.

@@ -1,7 +1,7 @@
 From d6b86595c0d5c5474e89afaeb6a07f3527f86c8c Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 18 Aug 2026 19:16:07 +0000
-Subject: [PATCH 3/4] feat(telemetry): report real host metrics, or null, never
+Subject: [PATCH 3/6] feat(telemetry): report real host metrics, or null, never
  fabricated values
 
 Live mode presented several invented figures as measurements:

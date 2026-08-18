@@ -1,7 +1,7 @@
 From 89309a544c85c27dc8dcc7ef7767f6f170e2d533 Mon Sep 17 00:00:00 2001
 From: Cursor Agent <cursoragent@cursor.com>
 Date: Tue, 18 Aug 2026 19:19:09 +0000
-Subject: [PATCH 4/4] test: cover nullable metrics and cockpit auth invariants
+Subject: [PATCH 4/6] test: cover nullable metrics and cockpit auth invariants
 
 Make the null-vs-zero distinction explicit in the type system: metrics the
 node cannot measure are typed MaybeMetric and recorded in
