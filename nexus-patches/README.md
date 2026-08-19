@@ -17,20 +17,23 @@ git checkout -b cursor/nexus-production-hardening main
 
 # Copy the patch files from this repo, then:
 git am 000*.patch
+# 0010 and 0011 are included in that glob (eleven patches total).
 
 npm install
 npx tsc --noEmit     # clean
-npm run test         # 359 passing (was 346 after 0007–0009; 291 on unpatched main)
+npm run test         # 359 passing after 0010/0011 (346 after 0007–0009; 291 on unpatched main)
 npm run build        # succeeds
 ```
 
 Verified end to end in a fresh clone of `harvester-nexus` at `main` (`1b865a8a`):
-all nine patches apply cleanly with `git am`, `tsc --noEmit` is clean, 346 tests
+patches 0001–0009 apply cleanly with `git am`, `tsc --noEmit` is clean, 346 tests
 pass, and the production build succeeds. Patch **0010** is additional work on
 top of 0001–0009: `tsc --noEmit` clean, **359** tests, `npm run build` succeeds.
 On this Cloud Agent node, `memory_tiering.py --discover-only` saw DRAM node 0,
 `memory_tier4`, zswap/DAMON/weighted-interleave/demotion sysfs present, and
-correctly waited for CXL/PMem/NVMe.
+correctly waited for CXL/PMem/NVMe. Patch **0011** stamps the product as
+**Nexus 3.0.0** (`3.0.0+nexus.1` ISO) because more than ten production features
+landed on top of 2.0.
 
 ## What each patch does
 
@@ -197,6 +200,21 @@ meminfo, vmstat demote/promote/swap/zswap, PSI, hugepages, and tier
 nodelists, using `null` for counters the kernel does not export.
 
 See `docs/memory-tiering.md` in harvester-nexus after applying the patch.
+
+### 0011 — `chore(release)`: bump Harvester Nexus to 3.0.0
+
+The 2.0 line already shipped Poly-Compute, the storage fabric, XDR/MDR, and
+acceleration. Patches 0001–0010 then added eleven production features
+(authenticated BFF, ISO CI, measured telemetry, nullable metrics, AnyRAID on
+LVM, live XDR ingest, Oscilloscope/FFT from host counters, KubeVirt
+VNC/serial, Linux memory tiering, live Processor & Memory, KubeVirt tiering
+hints). That crosses the 5–10 feature bar for a 3.0 release.
+
+- `package.json` / lockfile: `3.0.0`
+- `installer/VERSION`: `3.0.0+nexus.1` (CI still appends `.main.<run>.<sha>`)
+- Feature ConfigMap `config.version` `3.0.0`, ISO names, bootstrap stamp
+  (reads `/etc/nexus/version` when present)
+- README **Nexus 3.0 release** section; 2.0 kept as the historical baseline
 
 ## Still outstanding
 
