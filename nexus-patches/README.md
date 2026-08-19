@@ -17,11 +17,11 @@ git checkout -b cursor/nexus-production-hardening main
 
 # Copy the patch files from this repo, then:
 git am 000*.patch
-# 0010–0012 are included in that glob (twelve patches total).
+# 0010–0013 are included in that glob (thirteen patches total).
 
 npm install
 npx tsc --noEmit     # clean
-npm run test         # 359 passing after 0010/0011 (346 after 0007–0009; 291 on unpatched main)
+npm run test         # 365 passing after 0013 (359 after 0010/0011; 346 after 0007–0009)
 npm run build        # succeeds
 ```
 
@@ -33,7 +33,10 @@ On this Cloud Agent node, `memory_tiering.py --discover-only` saw DRAM node 0,
 `memory_tier4`, zswap/DAMON/weighted-interleave/demotion sysfs present, and
 correctly waited for CXL/PMem/NVMe. Patch **0011** stamps the product as
 **Nexus 3.0.0** (`3.0.0+nexus.1` ISO) because more than ten production features
-landed on top of 2.0.
+landed on top of 2.0. Patch **0013** adds live accelerator metrics: `tsc --noEmit`
+clean, **365** tests, `npm run build` succeeds. On this Cloud Agent node,
+`accelerator_inventory.py` reported zero cards and waited for
+npu-gaudi / npu-qaic / tpu-coral / fpga-alveo / fpga-intel-dfl / gpu-nvidia.
 
 ## What each patch does
 
@@ -233,6 +236,23 @@ first boot without supporting every vendor:
 
 See `docs/accelerators.md` after applying the patch.
 
+### 0013 — `feat(telemetry)`: live NPU/TPU/FPGA metrics on Acceleration dashboards
+
+The Acceleration view hid behind a demo-catalog placeholder in live mode.
+This patch inventories allowlisted add-in cards from sysfs and plots
+**performance + issues** on the existing Acceleration dashboard and Mission
+Control:
+
+- PCIe current vs max link (downshift)
+- AER correctable / uncorrectable
+- hwmon temperature
+- driver, NUMA, IOMMU, runtime power
+- `waitingForHardware` for missing families
+- utilization stays `null` (no invented TOPS/%)
+
+`GET /api/v1/telemetry/accelerators` plus `acceleration` on the dashboards
+payload. VFIO claiming is still not done (0012 design).
+
 ## Still outstanding
 
 Not addressed by these patches:
@@ -243,9 +263,9 @@ Not addressed by these patches:
   node with `/dev/kvm` and the KubeVirt operator.
 - **`lvcreate` for AnyRAID** is still unverified on kernels without
   device-mapper (see 0005).
-- **NPU/TPU/FPGA host agent** is design-only in 0012. The Acceleration
-  dashboard still uses catalog placeholders until an agent claims
-  allowlisted PCI IDs.
+- **NPU/TPU/FPGA VFIO claiming** is still design-only (0012). 0013 inventories
+  cards and shows metrics/issues; it does not bind `vfio-pci` or deploy vendor
+  device plugins.
 
 ## Reproducing the live-cluster verification
 
