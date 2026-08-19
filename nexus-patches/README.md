@@ -17,11 +17,11 @@ git checkout -b cursor/nexus-production-hardening main
 
 # Copy the patch files from this repo, then:
 git am 000*.patch
-# 0010–0014 are included in that glob (fourteen patches total).
+# 0010–0015 are included in that glob (fifteen patches total).
 
 npm install
 npx tsc --noEmit     # clean
-npm run test         # 376 passing after 0014 (365 after 0013; 359 after 0010/0011; 346 after 0007–0009)
+npm run test         # 388 passing after 0015 (376 after 0014; 365 after 0013)
 npm run build        # succeeds
 ```
 
@@ -39,7 +39,10 @@ clean, **365** tests, `npm run build` succeeds. On this Cloud Agent node,
 npu-gaudi / npu-qaic / tpu-coral / fpga-alveo / fpga-intel-dfl / gpu-nvidia.
 Patch **0014** folds that inventory onto the environment tick so CPU/RAM
 hardware dashboards show FPGA/GPU/NPU automatically (`tsc --noEmit` clean,
-**376** tests).
+**376** tests). Patch **0015** live-verifies those collectors on this k3s
+node and fixes `collect_dashboards_live` (`_parse_cpu_cores` was never
+imported, so `/api/v1/telemetry/dashboards` crashed before Acceleration or
+`environment.accelerators` could be served). **388** tests.
 
 ## What each patch does
 
@@ -267,6 +270,22 @@ as CPU/RAM (`accelerators` on `/api/v1/telemetry/environment`):
 - Processor & Memory, Resource Monitor, Environment Intel, Operations,
   Mission Control, Telemetry Wave: totals + inventory from that tick
 - Utilization stays `null`; hottestC is `null` without hwmon
+
+### 0015 — `test`: live-verify accelerator tick; fix dashboards collector
+
+Verification of 0013/0014 against this Cloud Agent k3s node, plus a bug that
+blocked it: `dashboard_collectors.collect_dashboards_live` called
+`_parse_cpu_cores` without importing it, so `/api/v1/telemetry/dashboards`
+raised `NameError` before Acceleration or `environment.accelerators` could
+be returned.
+
+Adds collector contract tests (`collect_environment` + `collect_dashboards_live`
+must attach `accelerators` next to CPU/RAM) and source-scan tests that every
+CPU/RAM dashboard still imports `HardwareAddOnPanel` / ticker cells.
+
+On this node: `cpuPercent` 3.6, `ramPercent` 18.2, `accelerators.cards` 0,
+`waitingForHardware` populated, `hottestC` null, `metricSources.accelerators`
+`sysfs-pci`. `npx tsc --noEmit` clean, **388** tests, `npm run build` succeeds.
 
 ## Still outstanding
 
