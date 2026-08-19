@@ -17,11 +17,11 @@ git checkout -b cursor/nexus-production-hardening main
 
 # Copy the patch files from this repo, then:
 git am 000*.patch
-# 0010–0013 are included in that glob (thirteen patches total).
+# 0010–0014 are included in that glob (fourteen patches total).
 
 npm install
 npx tsc --noEmit     # clean
-npm run test         # 365 passing after 0013 (359 after 0010/0011; 346 after 0007–0009)
+npm run test         # 376 passing after 0014 (365 after 0013; 359 after 0010/0011; 346 after 0007–0009)
 npm run build        # succeeds
 ```
 
@@ -37,6 +37,9 @@ landed on top of 2.0. Patch **0013** adds live accelerator metrics: `tsc --noEmi
 clean, **365** tests, `npm run build` succeeds. On this Cloud Agent node,
 `accelerator_inventory.py` reported zero cards and waited for
 npu-gaudi / npu-qaic / tpu-coral / fpga-alveo / fpga-intel-dfl / gpu-nvidia.
+Patch **0014** folds that inventory onto the environment tick so CPU/RAM
+hardware dashboards show FPGA/GPU/NPU automatically (`tsc --noEmit` clean,
+**376** tests).
 
 ## What each patch does
 
@@ -252,6 +255,18 @@ Control:
 
 `GET /api/v1/telemetry/accelerators` plus `acceleration` on the dashboards
 payload. VFIO claiming is still not done (0012 design).
+
+### 0014 — `feat(telemetry)`: FPGA/GPU/NPU on CPU/RAM hardware dashboards
+
+0013 only painted Acceleration and a Mission Control footer. CPU %, DRAM %,
+NUMA, and the Resource Monitor HUD still ignored add-in cards. This patch
+adds `environment_summary()` and attaches it to the same environment poll
+as CPU/RAM (`accelerators` on `/api/v1/telemetry/environment`):
+
+- Environment ticker: Accel cards / issues / hottest °C next to CPU and DRAM
+- Processor & Memory, Resource Monitor, Environment Intel, Operations,
+  Mission Control, Telemetry Wave: totals + inventory from that tick
+- Utilization stays `null`; hottestC is `null` without hwmon
 
 ## Still outstanding
 
