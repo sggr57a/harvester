@@ -1,0 +1,1144 @@
+From 2e210f72e52d8660d751e1e5a3d713423e291c78 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 16:08:49 +0000
+Subject: [PATCH] feat(telemetry): show FPGA/GPU/NPU metrics on CPU/RAM
+ hardware dashboards
+
+Fold a compact accelerator summary onto the environment tick so Processor
+& Memory, Resource Monitor, Environment Intel, Mission Control, Operations,
+Telemetry Wave, and the environment ticker render add-in cards next to
+CPU and DRAM. Utilization stays null; hottestC is null without hwmon.
+---
+ AGENTS.md                                     |   2 +-
+ README.md                                     |   2 +-
+ docs/accelerators.md                          |  19 +++
+ .../usr/lib/nexus/accelerator_inventory.py    |  43 ++++++
+ .../overlay/usr/lib/nexus/cluster_metrics.py  |  30 ++++
+ .../usr/lib/nexus/dashboard_collectors.py     |   2 +
+ installer/tests/accelerator-inventory.test.ts |  55 +++++++
+ src/components/EnvironmentTicker.tsx          |   4 +-
+ src/components/dashboards/Dashboards.tsx      |  19 ++-
+ .../dashboards/EnvironmentIntelHudView.tsx    |  13 ++
+ .../dashboards/HardwareAddOnMetrics.tsx       |  67 +++++++++
+ src/components/dashboards/MissionControl.tsx  |  45 ++----
+ .../dashboards/ResourceMonitorHudView.tsx     |  16 ++
+ src/components/dashboards/TelemetryWave.tsx   |   9 +-
+ src/lib/liveTelemetry.test.ts                 |   7 +
+ src/lib/liveTelemetry.ts                      |   5 +
+ src/lib/telemetry/emptySnapshot.ts            |   8 +
+ src/lib/telemetry/environmentAdapter.test.ts  |  27 ++++
+ src/lib/telemetry/environmentAdapter.ts       |   1 +
+ src/lib/telemetry/hardwareAddOn.test.ts       | 126 ++++++++++++++++
+ src/lib/telemetry/hardwareAddOn.ts            | 137 ++++++++++++++++++
+ src/lib/telemetry/types.ts                    |   4 +
+ src/styles.css                                |  14 ++
+ 23 files changed, 615 insertions(+), 40 deletions(-)
+ create mode 100644 src/components/dashboards/HardwareAddOnMetrics.tsx
+ create mode 100644 src/lib/telemetry/hardwareAddOn.test.ts
+ create mode 100644 src/lib/telemetry/hardwareAddOn.ts
+
+diff --git a/AGENTS.md b/AGENTS.md
+index d297095f..e22776e4 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -48,4 +48,4 @@ because it has no backend to authenticate against.
+ - Live XDR events come from Falco / Tetragon / Suricata / Wazuh pod logs via `xdr_ingest.py`; Kubernetes Warning events keep a derived severity instead of a hardcoded `medium`.
+ - Live consoles attach through `console_proxy.py` (`/api/v1/console/{vnc,serial,exec}`) onto KubeVirt subresources or `kubectl exec`. `src/lib/demoConsole.ts` is demo-mode only.
+ - Memory tiering is host-side (`memory_tiering.py` + `nexus-memory-tiering.service`). Live Processor & Memory reads `/proc` and `/sys` (demotion, zswap, swap, PSI, NUMA). Do not fabricate tier capacity when the hardware is absent — list it under `waitingForHardware`.
+-- NPU / TPU / FPGA add-in cards: allowlist in `docs/accelerators.md`. Live Acceleration and Mission Control inventory comes from `accelerator_inventory.py` (PCIe link, AER, temp, driver, IOMMU). Do not fabricate card utilization. Default future consumption is Harvester `pcidevices-controller` VFIO, not a generic device plugin.
++- NPU / TPU / FPGA add-in cards: allowlist in `docs/accelerators.md`. Live inventory comes from `accelerator_inventory.py` (PCIe link, AER, temp, driver, IOMMU) and is folded into the environment tick (`accelerators`) so Processor & Memory, Resource Monitor, Environment Intel, Mission Control, Operations, and the environment ticker show the same cards next to CPU/RAM. Do not fabricate card utilization. Default future consumption is Harvester `pcidevices-controller` VFIO, not a generic device plugin.
+diff --git a/README.md b/README.md
+index ee3a66de..6e89c2e7 100644
+--- a/README.md
++++ b/README.md
+@@ -30,7 +30,7 @@ Highlights:
+ 
+ - **Poly-Compute Engine** — runs KubeVirt VMs, Incus / LXC system containers, and native Kubernetes pods on the same bare-metal loop, with NUMA-local DRAM affinity, 1 GiB hugepages for KubeVirt, nested-virt opt-in pools, and cross-socket cost penalties on the scheduler.
+ - **Universal Storage Fabric** — every storage backend in the catalog is wired into CSI / direct-host paths, including **Vitastor** with SPDK userspace queues, NVMe-oF / RDMA with userspace bypass, ZFS with copy-on-write + zstd + ARC cache, **AnyRAID** with heterogeneous-capacity drive slabbing, iSCSI multipath via `vfio-pci`, and NFS / SMB through the subpath driver for RWX shares.
+-- **Hardware acceleration** — SPDK userspace NVMe-oF queues, DPDK polled-mode rings, vhost-user fast paths, NUMA pinning with 1 GiB hugepages, GPU / FPGA / smart-NIC / TPU pass-through (vfio-pci / SR-IOV / mdev), and L1 nested virtualization for training, inference, sandbox, and CI pools. NPU / TPU / FPGA **add-in cards** are an allowlisted first-boot path (AMD Alveo, Intel DFL FPGA, Intel Gaudi 3 PCIe, Qualcomm Cloud AI 100, Google Coral Edge TPU) — see [`docs/accelerators.md`](./docs/accelerators.md). The Acceleration dashboard still uses catalog rows until that agent lands.
++- **Hardware acceleration** — SPDK userspace NVMe-oF queues, DPDK polled-mode rings, vhost-user fast paths, NUMA pinning with 1 GiB hugepages, GPU / FPGA / smart-NIC / TPU pass-through (vfio-pci / SR-IOV / mdev), and L1 nested virtualization for training, inference, sandbox, and CI pools. NPU / TPU / FPGA **add-in cards** are an allowlisted first-boot path (AMD Alveo, Intel DFL FPGA, Intel Gaudi 3 PCIe, Qualcomm Cloud AI 100, Google Coral Edge TPU) — see [`docs/accelerators.md`](./docs/accelerators.md). Live PCI inventory (link, AER, temp, driver, IOMMU) lands on the environment tick and is shown automatically next to CPU/RAM on Processor & Memory, Resource Monitor, Environment Intel, Mission Control, Operations, and the environment ticker. Utilization stays `null` unless a vendor runtime exports it.
+ - **Memory tiering** — Linux NUMA demotion/promotion for CXL Type-3 and leftover Optane/PMem (DAX kmem), HBM when the kernel groups it as a faster node, zswap plus a bounded NVMe-backed swap file as the last safety net, DAMON/weighted-interleave/pghot/CXL-pooling hooks that activate when those sysfs trees appear. This is **not** vSphere NVMe-as-RAM; guests do not see extra DRAM. See [`docs/memory-tiering.md`](./docs/memory-tiering.md).
+ - **Machine Wizard 2.0** — install YAML with `poly_compute` and `hardware_acceleration` blocks plus boot-parameter switches (`nexus.poly_compute=kubevirt,incus,pods`, `nexus.acceleration.spdk=true`, `nexus.acceleration.hugepages_1g=64`, `nexus.acceleration.gpu_passthrough=true`). Validation refuses configs that turn off every runtime or enable GPU pass-through without NUMA pinning.
+ - **Built-in XDR / MDR platform (100% FOSS)** — every Nexus install ships with a complete detect-and-respond stack: 17 open-source sensors (Falco, Tetragon, Wazuh, Trivy, Grype, Syft, Suricata, Hubble, OpenSearch, MISP, kube-bench, kube-hunter, Polaris, OpenCanary, OpenSCAP, Lynis), 10 free threat-intel feeds (MISP, OTX, ThreatFox, URLhaus, Feodotracker, ETOpen, MITRE ATT&CK, NVD, OSV, internal allowlist), 18 Sigma-style detection rules covering all seven MITRE ATT&CK kill-chain phases, 10 automated response actions that emit real Kubernetes manifests (Cilium NetworkPolicy isolate, Harvester host cordon/drain, KubeVirt `VirtualMachineSnapshot`, Incus snapshot, Tetragon `TracingPolicy` SIGKILL, ArgoCD rollback, Trivy image block, Cilium CCNP egress-domain block), and APT geo-attribution that maps sources to actors like APT28 / LAZARUS. No paid SKUs, no subscriptions.
+diff --git a/docs/accelerators.md b/docs/accelerators.md
+index b803da0e..195f8765 100644
+--- a/docs/accelerators.md
++++ b/docs/accelerators.md
+@@ -136,6 +136,25 @@ The Acceleration dashboard and Mission Control consume
+ `GET /api/v1/telemetry/accelerators` (also nested under dashboards as
+ `acceleration`). Host collector: `accelerator_inventory.py`.
+ 
++The same poll also folds a compact summary onto
++`GET /api/v1/telemetry/environment` as `accelerators` (card count, issues,
++hottest `hwmon` °C, per-kind counts, per-card link/temp/issues). Every
++dashboard that already shows CPU, RAM, or other host hardware therefore
++renders FPGA / GPU / NPU / TPU automatically:
++
++| Surface | How add-in cards appear |
++|---|---|
++| Environment ticker (all views) | Accel cards / issues / hottest °C next to CPU % and DRAM % |
++| Processor & Memory | Header totals + PCI inventory panel beside NUMA / DRAM tiers |
++| Resource Monitor HUD | Totals, ACCEL tile, rings, linear bar, card list |
++| Environment Intel HUD | Totals, thermal tile, card list |
++| Mission Control | Header totals, Accel °C ring, inventory panel |
++| Operations (live) | Header totals next to CPU / RAM / watts + inventory panel |
++| Telemetry Wave (demo) | Totals and ACCEL readout next to CPU / DRAM |
++
++Live mode never substitutes catalog Coral / Alveo U200 rows. Missing
++families stay `waitingForHardware`. Utilization stays `null`.
++
+ Measured when sysfs exports them:
+ 
+ - PCIe current vs max link speed/width (downshift is an issue)
+diff --git a/installer/overlay/usr/lib/nexus/accelerator_inventory.py b/installer/overlay/usr/lib/nexus/accelerator_inventory.py
+index 2676cb0d..10d5310e 100644
+--- a/installer/overlay/usr/lib/nexus/accelerator_inventory.py
++++ b/installer/overlay/usr/lib/nexus/accelerator_inventory.py
+@@ -328,6 +328,49 @@ def live_dashboard(sys_root: str = "/sys", proc_root: str = "/proc") -> dict[str
+     }
+ 
+ 
++def environment_summary(sys_root: str = "/sys") -> dict[str, Any]:
++    """Compact add-in card pulse for the same tick as CPU / RAM / watts.
++
++    Dashboards that already render host hardware (ticker, Processor & Memory,
++    Resource Monitor, Environment Intel, Operations) consume this object so
++    FPGA / GPU / NPU / TPU metrics appear automatically next to those KPIs.
++    Utilization is never invented here — hottestC stays None without hwmon.
++    """
++    dash = live_dashboard(sys_root=sys_root)
++    devices = dash.get("devices") or []
++    by_kind: dict[str, int] = {}
++    temps: list[int] = []
++    compact: list[dict[str, Any]] = []
++    for dev in devices:
++        kind = str(dev.get("kind") or "other")
++        by_kind[kind] = by_kind.get(kind, 0) + 1
++        temp = dev.get("temperatureC")
++        if isinstance(temp, (int, float)):
++            temps.append(int(temp))
++        compact.append(
++            {
++                "id": dev.get("bdf") or dev.get("id"),
++                "kind": kind,
++                "model": dev.get("model"),
++                "temperatureC": temp,
++                "linkDownshifted": dev.get("linkDownshifted"),
++                "issues": list(dev.get("issues") or []),
++                "currentLinkSpeed": dev.get("currentLinkSpeed"),
++                "driver": dev.get("driver"),
++            }
++        )
++    return {
++        "available": bool(dash.get("available", True)),
++        "cards": len(devices),
++        "issues": len(dash.get("issues") or []),
++        "hottestC": max(temps) if temps else None,
++        "byKind": by_kind,
++        "waitingForHardware": list(dash.get("waitingForHardware") or []),
++        "devices": compact,
++        "error": dash.get("error"),
++    }
++
++
+ if __name__ == "__main__":
+     import json
+     import sys
+diff --git a/installer/overlay/usr/lib/nexus/cluster_metrics.py b/installer/overlay/usr/lib/nexus/cluster_metrics.py
+index 33375291..849a4394 100644
+--- a/installer/overlay/usr/lib/nexus/cluster_metrics.py
++++ b/installer/overlay/usr/lib/nexus/cluster_metrics.py
+@@ -235,6 +235,31 @@ def _harvester_ready(kubeconfig: str) -> bool:
+     return True
+ 
+ 
++def _collect_accelerator_summary() -> dict[str, Any]:
++    """Add-in card pulse for the environment tick. Never invents utilization."""
++    try:
++        spec = importlib.util.spec_from_file_location(
++            "nexus_accelerator_inventory",
++            os.path.join(os.path.dirname(__file__), "accelerator_inventory.py"),
++        )
++        if spec is None or spec.loader is None:
++            raise ImportError("accelerator_inventory module missing")
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module.environment_summary()
++    except Exception as exc:  # noqa: BLE001
++        return {
++            "available": False,
++            "cards": 0,
++            "issues": 0,
++            "hottestC": None,
++            "byKind": {},
++            "waitingForHardware": [],
++            "devices": [],
++            "error": str(exc),
++        }
++
++
+ def _collect_host_metrics() -> dict[str, Any]:
+     """Real power / disk / network readings, or nulls when unavailable."""
+     try:
+@@ -332,6 +357,7 @@ def collect_environment() -> dict[str, Any]:
+     cluster_ready = _harvester_ready(kubeconfig)
+     host = _collect_host_metrics()
+     security = _security_posture(kubeconfig)
++    accelerators = _collect_accelerator_summary()
+ 
+     state = _load_state()
+     tick = int(state.get("tick", 0)) + 1
+@@ -361,12 +387,16 @@ def collect_environment() -> dict[str, Any]:
+         "nodeCount": node_count,
+         "podCount": pod_count,
+         "vmCount": vm_count,
++        # Same poll as CPU / RAM so every hardware dashboard can render
++        # FPGA / GPU / NPU / TPU without a second round trip.
++        "accelerators": accelerators,
+         # Per-metric provenance so the cockpit can label partial coverage
+         # rather than presenting every figure as equally authoritative.
+         "metricSources": {
+             **host.get("sources", {}),
+             "cpu": "metrics-server" if cpu_percent is not None else "unavailable (metrics-server not installed)",
+             "security": security.get("source", "unavailable"),
++            "accelerators": "sysfs-pci" if accelerators.get("available") else "unavailable",
+         },
+     }
+ 
+diff --git a/installer/overlay/usr/lib/nexus/dashboard_collectors.py b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+index 31eba879..c573540f 100644
+--- a/installer/overlay/usr/lib/nexus/dashboard_collectors.py
++++ b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+@@ -10,6 +10,7 @@ from typing import Any
+ 
+ from cluster_filters import is_user_namespace
+ from cluster_metrics import (
++    _collect_accelerator_summary,
+     _count_active_migrations,
+     _find_kubeconfig,
+     _kubectl_json,
+@@ -587,6 +588,7 @@ def collect_dashboards_live() -> dict[str, Any]:
+             "nodeCount": node_count,
+             "podCount": pod_count,
+             "vmCount": vm_count,
++            "accelerators": _collect_accelerator_summary(),
+         },
+         "storage": {
+             "pvcs": pvcs,
+diff --git a/installer/tests/accelerator-inventory.test.ts b/installer/tests/accelerator-inventory.test.ts
+index 9ba87889..ea50d1ed 100644
+--- a/installer/tests/accelerator-inventory.test.ts
++++ b/installer/tests/accelerator-inventory.test.ts
+@@ -226,3 +226,58 @@ describe('accelerator inventory · allowlisted cards', () => {
+     expect(dash.issues.join(' ')).toMatch(/no-driver|no-iommu/);
+   });
+ });
++
++describe('accelerator inventory · environment tick summary', () => {
++  it('folds card counts, hottest temp, and issues into a compact CPU/RAM-tick payload', () => {
++    const sys = join(workdir, 'env-summary', 'sys');
++    mkdirSync(join(sys, 'bus/pci/devices'), { recursive: true });
++    pciDevice(sys, '0000:3d:00.0', {
++      vendor: '1da3',
++      device: '1063',
++      classCode: '120000',
++      driver: 'habanalabs',
++      iommu: '12',
++      currentSpeed: '16.0 GT/s PCIe',
++      maxSpeed: '32.0 GT/s PCIe',
++      tempMilliC: '71000',
++    });
++    pciDevice(sys, '0000:81:00.0', {
++      vendor: '10ee',
++      device: '5000',
++      classCode: '120000',
++      driver: 'vfio-pci',
++      iommu: '21',
++      currentSpeed: '16.0 GT/s PCIe',
++      maxSpeed: '16.0 GT/s PCIe',
++      tempMilliC: '48000',
++    });
++
++    const summary = py<{
++      cards: number;
++      issues: number;
++      hottestC: number | null;
++      byKind: Record<string, number>;
++      waitingForHardware: string[];
++      devices: Array<{ id: string; kind: string; temperatureC: number | null }>;
++    }>(`print(json.dumps(ai.environment_summary(sys_root=${JSON.stringify(sys)})))`);
++
++    expect(summary.cards).toBe(2);
++    expect(summary.byKind.npu).toBe(1);
++    expect(summary.byKind.fpga).toBe(1);
++    expect(summary.hottestC).toBe(71);
++    expect(summary.issues).toBeGreaterThan(0);
++    expect(summary.waitingForHardware).toContain('tpu-coral');
++    expect(summary.devices.map((d) => d.kind).sort()).toEqual(['fpga', 'npu']);
++  });
++
++  it('reports zero cards and null hottestC when no allowlisted add-in is present', () => {
++    const sys = join(workdir, 'env-empty', 'sys');
++    mkdirSync(join(sys, 'bus/pci/devices'), { recursive: true });
++    const summary = py<{ cards: number; hottestC: number | null; waitingForHardware: string[] }>(
++      `print(json.dumps(ai.environment_summary(sys_root=${JSON.stringify(sys)})))`,
++    );
++    expect(summary.cards).toBe(0);
++    expect(summary.hottestC).toBeNull();
++    expect(summary.waitingForHardware.length).toBeGreaterThan(0);
++  });
++});
+diff --git a/src/components/EnvironmentTicker.tsx b/src/components/EnvironmentTicker.tsx
+index 08077245..d2c6f4c4 100644
+--- a/src/components/EnvironmentTicker.tsx
++++ b/src/components/EnvironmentTicker.tsx
+@@ -1,6 +1,7 @@
+ import { useEffect, useMemo, useRef, useState } from 'react';
+ import { formatNumber, type EnvironmentSnapshot } from '../lib/liveTelemetry';
+ import type { TelemetryMode, TelemetryState } from '../lib/telemetry/mode';
++import { hardwareTickerCells } from '../lib/telemetry/hardwareAddOn';
+ 
+ interface EnvironmentTickerProps {
+   snapshot: EnvironmentSnapshot;
+@@ -11,7 +12,7 @@ interface EnvironmentTickerProps {
+ }
+ 
+ interface Cell {
+-  key: keyof EnvironmentSnapshot['deltas'] | 'openCves' | 'trustScore';
++  key: string;
+   label: string;
+   value: string;
+   sub: string;
+@@ -77,6 +78,7 @@ export function EnvironmentTicker({
+         sub: 'rolling cluster avg',
+         delta: snapshot.deltas.ramPercent,
+       },
++      ...hardwareTickerCells(snapshot.accelerators),
+       {
+         key: 'watts',
+         label: 'Power',
+diff --git a/src/components/dashboards/Dashboards.tsx b/src/components/dashboards/Dashboards.tsx
+index 0d160e70..bccd9607 100644
+--- a/src/components/dashboards/Dashboards.tsx
++++ b/src/components/dashboards/Dashboards.tsx
+@@ -20,6 +20,7 @@ import { MachineDetailPanel } from '../MachineDetailPanel';
+ import { ConsoleSession } from '../ConsoleSession';
+ import { DemoCatalogPlaceholder, LiveEmptyPanel } from './LiveEmptyPanel';
+ import { ClusterRadar, ThreatIntelMap, WidgetTitle } from './Widgets';
++import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
+ import {
+   ChordDiagram,
+   ChordWithStats,
+@@ -1187,7 +1188,8 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource, processorM
+           <span className="dash-kicker">CORE // MEMORY</span>
+           <h2>{catalog.title}</h2>
+           <p>
+-            NUMA heatmap, DRAM/HBM/CXL/PMem/zswap/NVMe/swap tiers, PSI pressure, hugepages.
++            NUMA heatmap, DRAM/HBM/CXL/PMem/zswap/NVMe/swap tiers, PSI pressure, hugepages,
++            and allowlisted PCI add-in cards (FPGA / GPU / NPU / TPU) from the same hardware tick.
+             {isLive && extra?.policy ? ` Policy: ${extra.policy}.` : ''}
+           </p>
+         </div>
+@@ -1197,6 +1199,7 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource, processorM
+           {isLive ? (
+             <div><span>Demotion</span><strong>{extra?.demotionEnabled == null ? '—' : extra.demotionEnabled ? 'on' : 'off'}</strong></div>
+           ) : null}
++          <HardwareAddOnTotals summary={telemetry?.accelerators} />
+         </div>
+       </header>
+ 
+@@ -1294,6 +1297,8 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource, processorM
+         </article>
+       </div>
+ 
++      <HardwareAddOnPanel summary={telemetry?.accelerators} />
++
+       {isLive && extra?.vmstat ? (
+         <div className="dash-row dash-row-2">
+           <article className="dash-panel">
+@@ -1366,6 +1371,7 @@ export function OperationsDashboardView({ telemetry, dataSource, operationsLinks
+               <div><span>CPU</span><strong><LiveValue value={`${telemetry?.cpuPercent?.toFixed(1) ?? '0'}%`} /></strong></div>
+               <div><span>RAM</span><strong><LiveValue value={`${telemetry?.ramPercent?.toFixed(1) ?? '0'}%`} /></strong></div>
+               <div><span>Est. watts</span><strong><LiveValue value={telemetry?.watts ?? 0} /></strong></div>
++              <HardwareAddOnTotals summary={telemetry?.accelerators} />
+             </>
+           ) : (
+             <>
+@@ -1398,10 +1404,13 @@ export function OperationsDashboardView({ telemetry, dataSource, operationsLinks
+       )}
+ 
+       {isLive ? (
+-        <LiveEmptyPanel
+-          title="Compliance and chargeback panels are demo-only"
+-          detail="Live mode shows cluster CPU/RAM/watts and Harvester Grafana links above. Open Grafana for CVE, audit, GitOps, and backup metrics from rancher-monitoring."
+-        />
++        <>
++          <HardwareAddOnPanel summary={telemetry?.accelerators} />
++          <LiveEmptyPanel
++            title="Compliance and chargeback panels are demo-only"
++            detail="Live mode shows cluster CPU/RAM/watts, PCI add-in cards, and Harvester Grafana links above. Open Grafana for CVE, audit, GitOps, and backup metrics from rancher-monitoring."
++          />
++        </>
+       ) : (
+       <>
+       <div className="dash-row dash-row-2">
+diff --git a/src/components/dashboards/EnvironmentIntelHudView.tsx b/src/components/dashboards/EnvironmentIntelHudView.tsx
+index 8bed8b6a..e279c45e 100644
+--- a/src/components/dashboards/EnvironmentIntelHudView.tsx
++++ b/src/components/dashboards/EnvironmentIntelHudView.tsx
+@@ -25,6 +25,7 @@ import {
+   WorldTrafficGlobe,
+ } from './Widgets';
+ import { HologramHudShell } from './HologramHudShell';
++import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
+ import {
+   ConnectedColumnChart,
+   HudEventStrip,
+@@ -117,6 +118,7 @@ export function EnvironmentIntelHudView({
+           <div><span>Avg °C</span><strong>{model.nodes.length ? Math.round(model.nodes.reduce((s, n) => s + n.thermalC, 0) / model.nodes.length) : 0}°</strong></div>
+           <div><span>Power</span><strong>{Math.round(effectiveTelemetry?.watts ?? 0)}W</strong></div>
+           <div><span>Airflow</span><strong>{fmtMb(effectiveTelemetry?.ingressMbps ?? 0)}</strong></div>
++          <HardwareAddOnTotals summary={effectiveTelemetry?.accelerators} />
+         </div>
+       </header>
+ 
+@@ -142,6 +144,14 @@ export function EnvironmentIntelHudView({
+         <HudTile label="HUMIDITY" className="holo-gauge-sm">
+           <KpiTile label="HUM" value={fmtPct(effectiveTelemetry?.ramPercent ?? 43)} size="sm" series={humSeries} />
+         </HudTile>
++        <HudTile label="ACCEL" className="holo-gauge-sm">
++          <KpiTile
++            label="ACCEL"
++            value={effectiveTelemetry?.accelerators?.hottestC == null ? '—' : `${effectiveTelemetry.accelerators.hottestC}°`}
++            size="sm"
++            status={(effectiveTelemetry?.accelerators?.issues ?? 0) > 0 ? 'warn' : 'good'}
++          />
++        </HudTile>
+         <HudTile label="Facility event" className="holo-event" burst={burst}>
+           <HudEventStrip title="FACILITY EVENT" detail={eventDetail} />
+         </HudTile>
+@@ -282,6 +292,9 @@ export function EnvironmentIntelHudView({
+             }))}
+           />
+         </HudTile>
++        <HudTile label="Add-in cards" className="holo-table wide">
++          <HardwareAddOnPanel summary={effectiveTelemetry?.accelerators} />
++        </HudTile>
+       </div>
+       </HologramHudShell>
+     </section>
+diff --git a/src/components/dashboards/HardwareAddOnMetrics.tsx b/src/components/dashboards/HardwareAddOnMetrics.tsx
+new file mode 100644
+index 00000000..3713e31a
+--- /dev/null
++++ b/src/components/dashboards/HardwareAddOnMetrics.tsx
+@@ -0,0 +1,67 @@
++import type { EnvironmentAcceleratorSummary } from '../../lib/telemetry/hardwareAddOn';
++import { hardwareAddOnTotals } from '../../lib/telemetry/hardwareAddOn';
++import { WidgetTitle } from './Widgets';
++
++export function HardwareAddOnTotals({
++  summary,
++}: {
++  summary?: EnvironmentAcceleratorSummary;
++}) {
++  return (
++    <>
++      {hardwareAddOnTotals(summary).map((row) => (
++        <div key={row.label}>
++          <span>{row.label}</span>
++          <strong>{row.value}</strong>
++        </div>
++      ))}
++    </>
++  );
++}
++
++export function HardwareAddOnPanel({
++  summary,
++  title = 'NPU / TPU / FPGA / GPU',
++}: {
++  summary?: EnvironmentAcceleratorSummary;
++  title?: string;
++}) {
++  const cards = summary?.devices ?? [];
++  const waiting = summary?.waitingForHardware ?? [];
++  return (
++    <article className="dash-panel hardware-addon-panel" aria-label="Add-in accelerator cards">
++      <WidgetTitle
++        kicker="ACCEL"
++        title={title}
++        trailing={
++          <span className="osc-readout">
++            {summary?.cards ?? 0} cards · {summary?.issues ?? 0} issues
++          </span>
++        }
++      />
++      {cards.length === 0 ? (
++        <p>
++          No allowlisted add-in cards on this node.
++          {waiting.length > 0 ? ` Waiting: ${waiting.join(', ')}.` : ''}
++        </p>
++      ) : (
++        <ul className="passthrough-list">
++          {cards.map((dev) => (
++            <li key={dev.id} className={`pt-${dev.kind === 'npu' ? 'fpga' : dev.kind}`}>
++              <span className="kind-chip">{dev.kind}</span>
++              <strong>{dev.model}</strong>
++              <small>
++                {dev.id}
++                {dev.driver ? ` · ${dev.driver}` : ''}
++                {dev.temperatureC == null ? '' : ` · ${dev.temperatureC}°C`}
++                {dev.currentLinkSpeed ? ` · ${dev.currentLinkSpeed}` : ''}
++                {dev.linkDownshifted ? ' · link downshifted' : ''}
++                {dev.issues?.length ? ` · ${dev.issues.join(', ')}` : ''}
++              </small>
++            </li>
++          ))}
++        </ul>
++      )}
++    </article>
++  );
++}
+diff --git a/src/components/dashboards/MissionControl.tsx b/src/components/dashboards/MissionControl.tsx
+index ca9a8eb2..1420d9ac 100644
+--- a/src/components/dashboards/MissionControl.tsx
++++ b/src/components/dashboards/MissionControl.tsx
+@@ -1,6 +1,8 @@
+ import { useMemo } from 'react';
+ import type { EnvironmentSnapshot } from '../../lib/liveTelemetry';
+ import { MissionCustomizableArea } from './MissionCustomizableArea';
++import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
++import { summarizeFromPassThrough } from '../../lib/telemetry/hardwareAddOn';
+ import {
+   buildAccelerationDashboard,
+   buildMachinesDashboard,
+@@ -67,6 +69,7 @@ function LiveMissionControl({
+     () => [
+       { label: 'CPU pressure', value: telemetry?.cpuPercent ?? 0, color: 'accent' as const },
+       { label: 'DRAM utilisation', value: telemetry?.ramPercent ?? 0, color: 'accent-2' as const },
++      { label: 'Accel °C', value: telemetry?.accelerators?.hottestC ?? 0, color: 'danger' as const },
+       { label: 'IOPS (cluster)', value: telemetry ? Math.min(100, telemetry.totalIops / 10_000) : 0, color: 'good' as const },
+       { label: 'NIC ingress', value: telemetry ? Math.min(100, telemetry.ingressMbps / 1_000) : 0, color: 'warn' as const },
+     ],
+@@ -86,6 +89,7 @@ function LiveMissionControl({
+           <div><span>Migrations</span><strong>{telemetry?.activeMigrations ?? 0}</strong></div>
+           <div><span>CPU</span><strong>{telemetry?.cpuPercent?.toFixed(1) ?? '0'}%</strong></div>
+           <div><span>RAM</span><strong>{telemetry?.ramPercent?.toFixed(1) ?? '0'}%</strong></div>
++          <HardwareAddOnTotals summary={telemetry?.accelerators} />
+         </div>
+       </header>
+       <div className="dash-row dash-row-2">
+@@ -110,36 +114,9 @@ function LiveMissionControl({
+           <small>Platform infrastructure pods are excluded. Create a VM or deploy a workload to a tenant namespace to populate fleet views.</small>
+         </article>
+       )}
+-      <article className="dash-panel">
+-        <WidgetTitle
+-          kicker="ACCEL"
+-          title="NPU / TPU / FPGA / GPU"
+-          trailing={<span className="osc-readout">{acceleration?.passThrough.length ?? 0} cards · {acceleration?.issues?.length ?? 0} issues</span>}
+-        />
+-        {(acceleration?.passThrough.length ?? 0) === 0 ? (
+-          <p>
+-            No allowlisted add-in cards on this node.
+-            {(acceleration?.waitingForHardware?.length ?? 0) > 0
+-              ? ` Waiting: ${acceleration?.waitingForHardware?.join(', ')}.`
+-              : ''}
+-          </p>
+-        ) : (
+-          <ul className="passthrough-list">
+-            {(acceleration?.passThrough ?? []).map((dev) => (
+-              <li key={dev.id} className={`pt-${dev.kind === 'npu' ? 'fpga' : dev.kind}`}>
+-                <span className="kind-chip">{dev.kind}</span>
+-                <strong>{dev.model}</strong>
+-                <small>
+-                  {dev.id} · {dev.driver}
+-                  {dev.temperatureC == null ? '' : ` · ${dev.temperatureC}°C`}
+-                  {dev.currentLinkSpeed ? ` · ${dev.currentLinkSpeed}` : ''}
+-                  {dev.issues?.length ? ` · ${dev.issues.join(', ')}` : ''}
+-                </small>
+-              </li>
+-            ))}
+-          </ul>
+-        )}
+-      </article>
++      <HardwareAddOnPanel
++        summary={telemetry?.accelerators ?? (acceleration ? summarizeFromPassThrough(acceleration.passThrough, acceleration.waitingForHardware) : undefined)}
++      />
+     </section>
+   );
+ }
+@@ -363,12 +340,20 @@ export function MissionControlView({ telemetry, dataSource, acceleration }: Miss
+           <div><span>IOPS</span><strong>{telemetry ? `${(telemetry.totalIops / 1000).toFixed(0)}K` : '1.12M'}</strong></div>
+           <div><span>Watts</span><strong>{telemetry?.watts ?? 1592}</strong></div>
+           <div><span>Trust</span><strong>{telemetry?.trustScore ?? 87}</strong></div>
++          <HardwareAddOnTotals summary={telemetry?.accelerators} />
+         </div>
+       </header>
+ 
+       <div className="mission-kpi-row">
+         <KpiTile label="CPU" value={`${telemetry?.cpuPercent ?? 58}`} unit="%" delta={telemetry?.deltas.cpuPercent} series={cpuSeries} hint="rolling cluster avg" />
+         <KpiTile label="DRAM" value={`${telemetry?.ramPercent ?? 64}`} unit="%" delta={telemetry?.deltas.ramPercent} series={ramSeries} hint="DDR5 + memory tier" />
++        <KpiTile
++          label="Accel"
++          value={`${telemetry?.accelerators?.cards ?? 0}`}
++          unit="cards"
++          hint={telemetry?.accelerators?.hottestC == null ? 'PCI add-in cards' : `hottest ${telemetry.accelerators.hottestC}°C`}
++          status={(telemetry?.accelerators?.issues ?? 0) > 0 ? 'warn' : 'good'}
++        />
+         <KpiTile label="Cluster IOPS" value={telemetry ? `${(telemetry.totalIops / 1000).toFixed(0)}` : '1120'} unit="K" delta={telemetry ? Math.round(telemetry.deltas.totalIops / 1000) : 0} series={iopsSeries} hint="Ceph · NVMe-oF · Vitastor" status="good" />
+         <KpiTile label="Power" value={`${telemetry?.watts ?? 1592}`} unit="W" delta={telemetry?.deltas.watts} series={wattsSeries} hint="aggregate node draw" />
+         <KpiTile label="Ingress" value={telemetry ? `${(telemetry.ingressMbps / 1000).toFixed(1)}` : '78.4'} unit="Gb/s" delta={telemetry ? Math.round(telemetry.deltas.ingressMbps / 1000) : 0} series={ingressSeries} hint="NIC bonds aggregated" />
+diff --git a/src/components/dashboards/ResourceMonitorHudView.tsx b/src/components/dashboards/ResourceMonitorHudView.tsx
+index 8dc51a4e..27269439 100644
+--- a/src/components/dashboards/ResourceMonitorHudView.tsx
++++ b/src/components/dashboards/ResourceMonitorHudView.tsx
+@@ -24,6 +24,7 @@ import {
+   VerticalMeterBank,
+ } from './Widgets';
+ import { HologramHudShell } from './HologramHudShell';
++import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
+ import {
+   ConnectedColumnChart,
+   HudEventStrip,
+@@ -112,6 +113,7 @@ export function ResourceMonitorHudView({
+           <div><span>Nodes</span><strong>{model.nodes.length}</strong></div>
+           <div><span>CPU</span><strong>{fmtPct(effectiveTelemetry?.cpuPercent ?? model.nodes[0]?.cpu ?? 0)}</strong></div>
+           <div><span>Active ops</span><strong>{resourceMonitoring?.workItems.length ?? effectiveTelemetry?.activeMigrations ?? 0}</strong></div>
++          <HardwareAddOnTotals summary={effectiveTelemetry?.accelerators} />
+         </div>
+       </header>
+ 
+@@ -132,6 +134,15 @@ export function ResourceMonitorHudView({
+         <HudTile label="RAM" className="holo-gauge">
+           <KpiTile label="RAM" value={fmtPct(effectiveTelemetry?.ramPercent ?? 0)} size="sm" series={ramSeries} />
+         </HudTile>
++        <HudTile label="ACCEL" className="holo-gauge">
++          <KpiTile
++            label="ACCEL"
++            value={String(effectiveTelemetry?.accelerators?.cards ?? 0)}
++            unit="cards"
++            size="sm"
++            status={(effectiveTelemetry?.accelerators?.issues ?? 0) > 0 ? 'warn' : 'good'}
++          />
++        </HudTile>
+         <HudTile label="DISK" className="holo-gauge">
+           <KpiTile label="DSK" value={fmtK(effectiveTelemetry?.totalIops ?? 0)} unit="IOPS" size="sm" series={diskSeries} />
+         </HudTile>
+@@ -149,6 +160,7 @@ export function ResourceMonitorHudView({
+           <div className="holo-linear-grid">
+             <HudLinearBar label="WL" value={effectiveTelemetry?.cpuPercent ?? 0} max={100} />
+             <HudLinearBar label="MEM" value={effectiveTelemetry?.ramPercent ?? 0} max={100} tone="accent-2" />
++            <HudLinearBar label="ACC" value={effectiveTelemetry?.accelerators?.hottestC ?? 0} max={100} tone="danger" />
+             <HudLinearBar label="IO" value={effectiveTelemetry?.totalIops ?? 0} max={1_400_000} tone="good" />
+             <HudLinearBar label="NET" value={effectiveTelemetry?.ingressMbps ?? 0} max={110_000} tone="warn" />
+             <HudLinearBar label="IOPS" value={effectiveTelemetry?.totalIops ?? 0} max={1_400_000} tone="good" />
+@@ -187,6 +199,7 @@ export function ResourceMonitorHudView({
+               meters={[
+                 { label: 'CPU', value: effectiveTelemetry?.cpuPercent ?? 0 },
+                 { label: 'RAM', value: effectiveTelemetry?.ramPercent ?? 0 },
++                { label: 'ACC', value: effectiveTelemetry?.accelerators?.hottestC ?? 0 },
+               ]}
+             />
+           </div>
+@@ -284,6 +297,9 @@ export function ResourceMonitorHudView({
+             }))}
+           />
+         </HudTile>
++        <HudTile label="Add-in cards" className="holo-table holo-accel">
++          <HardwareAddOnPanel summary={effectiveTelemetry?.accelerators} />
++        </HudTile>
+       </div>
+       </HologramHudShell>
+     </section>
+diff --git a/src/components/dashboards/TelemetryWave.tsx b/src/components/dashboards/TelemetryWave.tsx
+index b044c473..586d4bd5 100644
+--- a/src/components/dashboards/TelemetryWave.tsx
++++ b/src/components/dashboards/TelemetryWave.tsx
+@@ -19,6 +19,7 @@ import {
+ 
+ import type { TelemetryDataSource } from '../../lib/telemetry/dashboardAdapters';
+ import { DemoCatalogPlaceholder } from './LiveEmptyPanel';
++import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
+ 
+ const accel = buildAccelerationDashboard();
+ 
+@@ -127,20 +128,22 @@ export function TelemetryWaveView({ telemetry, dataSource }: TelemetryWaveProps
+         <div className="dash-totals">
+           <div><span>SPDK lanes</span><strong>{accel.spdkLanes.length}</strong></div>
+           <div><span>DPDK ports</span><strong>{accel.dpdkPorts.length}</strong></div>
+-          <div><span>Pass-thru</span><strong>{accel.passThrough.length}</strong></div>
++          <div><span>Pass-thru</span><strong>{telemetry?.accelerators?.cards ?? accel.passThrough.length}</strong></div>
+           <div><span>Sample rate</span><strong>1.6 s/div</strong></div>
++          <HardwareAddOnTotals summary={telemetry?.accelerators} />
+         </div>
+       </header>
+ 
+       <div className="wave-stat-strip">
+         <StatGrid
+-          columns={8}
++          columns={9}
+           items={[
+             { label: 'NIC RX', value: telemetry ? (telemetry.ingressMbps / 1000).toFixed(1) : '78.4', unit: 'Gb/s', delta: telemetry ? telemetry.deltas.ingressMbps / 1000 : 0, status: 'good' },
+             { label: 'NIC TX', value: telemetry ? (telemetry.egressMbps / 1000).toFixed(1) : '74.8', unit: 'Gb/s', delta: telemetry ? telemetry.deltas.egressMbps / 1000 : 0, status: 'good' },
+             { label: 'IOPS', value: telemetry ? (telemetry.totalIops / 1000).toFixed(0) : '1120', unit: 'K', delta: telemetry ? telemetry.deltas.totalIops / 1000 : 0, status: 'good' },
+             { label: 'CPU', value: `${telemetry?.cpuPercent ?? 58}`, unit: '%', delta: telemetry?.deltas.cpuPercent, status: 'neutral' },
+             { label: 'DRAM', value: `${telemetry?.ramPercent ?? 64}`, unit: '%', delta: telemetry?.deltas.ramPercent, status: 'neutral' },
++            { label: 'ACCEL', value: `${telemetry?.accelerators?.cards ?? accel.passThrough.length}`, unit: 'cards', status: (telemetry?.accelerators?.issues ?? 0) > 0 ? 'warn' : 'good' },
+             { label: 'PWR', value: `${telemetry?.watts ?? 1592}`, unit: 'W', delta: telemetry?.deltas.watts },
+             { label: 'MIG', value: `${telemetry?.activeMigrations ?? 3}`, hint: 'in-flight' },
+             { label: 'TICK', value: telemetry?.tick ?? 0, hint: '1.6s sweep' },
+@@ -254,6 +257,8 @@ export function TelemetryWaveView({ telemetry, dataSource }: TelemetryWaveProps
+           </div>
+         </div>
+       </article>
++
++      <HardwareAddOnPanel summary={telemetry?.accelerators} />
+     </section>
+   );
+ }
+diff --git a/src/lib/liveTelemetry.test.ts b/src/lib/liveTelemetry.test.ts
+index 2dc3ffcc..19cab747 100644
+--- a/src/lib/liveTelemetry.test.ts
++++ b/src/lib/liveTelemetry.test.ts
+@@ -14,6 +14,13 @@ describe('nextSnapshot', () => {
+     expect(snap.deltas).toBeDefined();
+   });
+ 
++  it('includes demo add-in card counts on the same snapshot as CPU and DRAM', () => {
++    const snap = nextSnapshot();
++    expect(snap.accelerators?.cards).toBeGreaterThan(0);
++    expect(snap.accelerators?.byKind.gpu).toBeGreaterThan(0);
++    expect(snap.accelerators?.byKind.fpga).toBeGreaterThan(0);
++  });
++
+   it('advances tick and emits bounded deltas', () => {
+     const first = nextSnapshot();
+     const second = nextSnapshot(first);
+diff --git a/src/lib/liveTelemetry.ts b/src/lib/liveTelemetry.ts
+index e09b74d0..e9161aff 100644
+--- a/src/lib/liveTelemetry.ts
++++ b/src/lib/liveTelemetry.ts
+@@ -1,4 +1,5 @@
+ import { useEffect, useRef, useState } from 'react';
++import { demoAcceleratorSummary, type EnvironmentAcceleratorSummary } from './telemetry/hardwareAddOn';
+ 
+ export interface EnvironmentSnapshot {
+   /** Total monitored workloads (vm + lxc + pod + docker) across the synthetic environment */
+@@ -30,6 +31,8 @@ export interface EnvironmentSnapshot {
+   unavailableMetrics?: string[];
+   /** Per-metric provenance from the BFF, e.g. `{ cpu: 'metrics-server' }`. */
+   metricSources?: Record<string, string>;
++  /** FPGA / GPU / NPU / TPU pulse collected with CPU / RAM. */
++  accelerators?: EnvironmentAcceleratorSummary;
+   /** Rolling deltas vs previous tick (positive or negative) */
+   deltas: {
+     totalWorkloads: number;
+@@ -56,6 +59,7 @@ const BASE_SNAPSHOT: Omit<EnvironmentSnapshot, 'deltas' | 'tick'> = {
+   activeMigrations: 3,
+   openCves: 17,
+   trustScore: 87,
++  accelerators: demoAcceleratorSummary(),
+ };
+ 
+ function clamp(value: number, min: number, max: number): number {
+@@ -89,6 +93,7 @@ export function nextSnapshot(prev?: EnvironmentSnapshot): EnvironmentSnapshot {
+     activeMigrations,
+     openCves: seed.openCves,
+     trustScore: seed.trustScore,
++    accelerators: seed.accelerators ?? demoAcceleratorSummary(),
+     deltas: {
+       totalWorkloads: totalWorkloads - seed.totalWorkloads,
+       totalIops: totalIops - seed.totalIops,
+diff --git a/src/lib/telemetry/emptySnapshot.ts b/src/lib/telemetry/emptySnapshot.ts
+index cea63143..bf6674b9 100644
+--- a/src/lib/telemetry/emptySnapshot.ts
++++ b/src/lib/telemetry/emptySnapshot.ts
+@@ -13,6 +13,14 @@ export function emptyEnvironmentSnapshot(tick = 0): EnvironmentSnapshot {
+     activeMigrations: 0,
+     openCves: 0,
+     trustScore: 0,
++    accelerators: {
++      cards: 0,
++      issues: 0,
++      hottestC: null,
++      byKind: {},
++      waitingForHardware: [],
++      devices: [],
++    },
+     deltas: {
+       totalWorkloads: 0,
+       totalIops: 0,
+diff --git a/src/lib/telemetry/environmentAdapter.test.ts b/src/lib/telemetry/environmentAdapter.test.ts
+index 8a80f3a7..78671222 100644
+--- a/src/lib/telemetry/environmentAdapter.test.ts
++++ b/src/lib/telemetry/environmentAdapter.test.ts
+@@ -85,6 +85,33 @@ describe('payloadToEnvironmentSnapshot', () => {
+     );
+     expect(snap.metricSources?.cpu).toBe('metrics-server');
+   });
++
++  it('folds accelerator summary onto the same snapshot as CPU and DRAM', () => {
++    const snap = payloadToEnvironmentSnapshot(
++      payload({
++        accelerators: {
++          cards: 2,
++          issues: 1,
++          hottestC: 62,
++          byKind: { npu: 1, fpga: 1 },
++          waitingForHardware: ['tpu-coral'],
++          devices: [
++            { id: '0000:3d:00.0', kind: 'npu', model: 'Intel Gaudi 3 PCIe', temperatureC: 62, issues: ['pcie-link-downshifted'] },
++          ],
++        },
++      }),
++    );
++    expect(snap.accelerators?.cards).toBe(2);
++    expect(snap.accelerators?.hottestC).toBe(62);
++    expect(snap.accelerators?.devices[0].kind).toBe('npu');
++    expect(snap.cpuPercent).toBe(22);
++    expect(snap.ramPercent).toBe(51);
++  });
++
++  it('does not invent an accelerator summary when the BFF omitted the field', () => {
++    const snap = payloadToEnvironmentSnapshot(payload());
++    expect(snap.accelerators).toBeUndefined();
++  });
+ });
+ 
+ describe('formatMetric', () => {
+diff --git a/src/lib/telemetry/environmentAdapter.ts b/src/lib/telemetry/environmentAdapter.ts
+index d1ccbdc2..22f8cf3d 100644
+--- a/src/lib/telemetry/environmentAdapter.ts
++++ b/src/lib/telemetry/environmentAdapter.ts
+@@ -53,6 +53,7 @@ export function payloadToEnvironmentSnapshot(
+     tick: payload.tick,
+     unavailableMetrics,
+     metricSources: payload.metricSources,
++    accelerators: payload.accelerators,
+   };
+ 
+   if (!previous) {
+diff --git a/src/lib/telemetry/hardwareAddOn.test.ts b/src/lib/telemetry/hardwareAddOn.test.ts
+new file mode 100644
+index 00000000..04a3cd9d
+--- /dev/null
++++ b/src/lib/telemetry/hardwareAddOn.test.ts
+@@ -0,0 +1,126 @@
++import { describe, expect, it } from 'vitest';
++import { buildAccelerationDashboard } from '../dashboards';
++import {
++  hardwareAddOnTotals,
++  hardwareTickerCells,
++  summarizeFromPassThrough,
++} from './hardwareAddOn';
++
++describe('summarizeFromPassThrough', () => {
++  it('counts cards by kind, hottest measured temp, and issues without inventing utilization', () => {
++    const summary = summarizeFromPassThrough(
++      [
++        {
++          id: '0000:3d:00.0',
++          kind: 'npu',
++          model: 'Intel Gaudi 3 PCIe',
++          boundTo: 'vfio-pci',
++          driver: 'vfio-pci',
++          utilizationPercent: null,
++          memoryGiB: null,
++          temperatureC: 62,
++          issues: ['pcie-link-downshifted'],
++        },
++        {
++          id: '0000:81:00.0',
++          kind: 'fpga',
++          model: 'AMD Alveo / Xilinx FPGA',
++          boundTo: 'vfio-pci',
++          driver: 'vfio-pci',
++          utilizationPercent: null,
++          memoryGiB: null,
++          temperatureC: 48,
++          issues: [],
++        },
++      ],
++      ['tpu-coral'],
++    );
++    expect(summary.cards).toBe(2);
++    expect(summary.byKind).toEqual({ npu: 1, fpga: 1 });
++    expect(summary.hottestC).toBe(62);
++    expect(summary.issues).toBe(1);
++    expect(summary.waitingForHardware).toEqual(['tpu-coral']);
++    expect(summary.devices.every((d) => d.kind === 'npu' || d.kind === 'fpga')).toBe(true);
++  });
++
++  it('keeps hottestC null when no card reports temperature', () => {
++    const summary = summarizeFromPassThrough(
++      [
++        {
++          id: '0000:04:00.0',
++          kind: 'tpu',
++          model: 'Google Coral Edge TPU',
++          boundTo: 'unbound',
++          driver: 'none',
++          utilizationPercent: null,
++          memoryGiB: null,
++          temperatureC: null,
++          issues: ['no-driver'],
++        },
++      ],
++      [],
++    );
++    expect(summary.hottestC).toBeNull();
++    expect(summary.cards).toBe(1);
++    expect(summary.issues).toBe(1);
++  });
++});
++
++describe('hardwareTickerCells', () => {
++  it('sits next to CPU/RAM with card count, issues, and hottest temp (or dash)', () => {
++    const cells = hardwareTickerCells({
++      cards: 3,
++      issues: 2,
++      hottestC: 71,
++      byKind: { gpu: 1, npu: 1, fpga: 1 },
++      waitingForHardware: ['tpu-coral'],
++      devices: [],
++    });
++    const labels = cells.map((c) => c.label);
++    expect(labels).toEqual(['Accel cards', 'Accel issues', 'Accel °C']);
++    expect(cells[0].value).toBe('3');
++    expect(cells[0].sub).toMatch(/gpu/i);
++    expect(cells[1].value).toBe('2');
++    expect(cells[2].value).toBe('71°');
++  });
++
++  it('renders a dash for hottest temp when no hwmon reading exists', () => {
++    const cells = hardwareTickerCells({
++      cards: 0,
++      issues: 0,
++      hottestC: null,
++      byKind: {},
++      waitingForHardware: ['npu-gaudi'],
++      devices: [],
++    });
++    expect(cells[0].value).toBe('0');
++    expect(cells[2].value).toBe('—');
++    expect(cells[0].sub).toMatch(/waiting/i);
++  });
++});
++
++describe('hardwareAddOnTotals', () => {
++  it('emits the same compact totals used beside CPU/RAM on hardware dashboards', () => {
++    const totals = hardwareAddOnTotals({
++      cards: 2,
++      issues: 1,
++      hottestC: 62,
++      byKind: { npu: 1, fpga: 1 },
++      waitingForHardware: [],
++      devices: [],
++    });
++    expect(totals).toEqual([
++      { label: 'Accel', value: '2' },
++      { label: 'Accel issues', value: '1' },
++      { label: 'Accel °C', value: '62°' },
++    ]);
++  });
++
++  it('summarizes the demo catalog pass-through rows so demo dashboards stay consistent', () => {
++    const demo = summarizeFromPassThrough(buildAccelerationDashboard().passThrough);
++    expect(demo.cards).toBeGreaterThan(0);
++    expect(demo.byKind.gpu).toBeGreaterThan(0);
++    expect(demo.byKind.fpga).toBeGreaterThan(0);
++    expect(demo.byKind.tpu).toBeGreaterThan(0);
++  });
++});
+diff --git a/src/lib/telemetry/hardwareAddOn.ts b/src/lib/telemetry/hardwareAddOn.ts
+new file mode 100644
+index 00000000..75dad280
+--- /dev/null
++++ b/src/lib/telemetry/hardwareAddOn.ts
+@@ -0,0 +1,137 @@
++import { buildAccelerationDashboard, type PassThroughDevice } from '../dashboards';
++
++/** Compact PCI add-in card on the environment tick (same pulse as CPU / RAM). */
++export interface EnvironmentAccelDevice {
++  id: string;
++  kind: string;
++  model: string;
++  temperatureC?: number | null;
++  linkDownshifted?: boolean;
++  issues?: string[];
++  currentLinkSpeed?: string | null;
++  driver?: string | null;
++}
++
++export interface EnvironmentAcceleratorSummary {
++  cards: number;
++  issues: number;
++  hottestC: number | null;
++  byKind: Record<string, number>;
++  waitingForHardware: string[];
++  devices: EnvironmentAccelDevice[];
++  available?: boolean;
++  error?: string | null;
++}
++
++export interface HardwareTickerCell {
++  key: 'accelCards' | 'accelIssues' | 'accelHottestC';
++  label: string;
++  value: string;
++  sub: string;
++  delta?: number;
++}
++
++export interface HardwareTotal {
++  label: string;
++  value: string;
++}
++
++export function emptyAcceleratorSummary(): EnvironmentAcceleratorSummary {
++  return {
++    cards: 0,
++    issues: 0,
++    hottestC: null,
++    byKind: {},
++    waitingForHardware: [],
++    devices: [],
++    available: true,
++  };
++}
++
++function kindBreakdown(byKind: Record<string, number>): string {
++  const parts = Object.entries(byKind)
++    .filter(([, count]) => count > 0)
++    .sort(([a], [b]) => a.localeCompare(b))
++    .map(([kind, count]) => `${count} ${kind}`);
++  return parts.length > 0 ? parts.join(' · ') : 'none present';
++}
++
++export function summarizeFromPassThrough(
++  devices: PassThroughDevice[],
++  waitingForHardware: string[] = [],
++): EnvironmentAcceleratorSummary {
++  const byKind: Record<string, number> = {};
++  const temps: number[] = [];
++  let issues = 0;
++  const compact: EnvironmentAccelDevice[] = devices.map((dev) => {
++    byKind[dev.kind] = (byKind[dev.kind] ?? 0) + 1;
++    if (typeof dev.temperatureC === 'number' && Number.isFinite(dev.temperatureC)) {
++      temps.push(dev.temperatureC);
++    }
++    issues += dev.issues?.length ?? 0;
++    return {
++      id: dev.id,
++      kind: dev.kind,
++      model: dev.model,
++      temperatureC: dev.temperatureC ?? null,
++      linkDownshifted: dev.linkDownshifted,
++      issues: dev.issues ?? [],
++      currentLinkSpeed: dev.currentLinkSpeed ?? null,
++      driver: dev.driver,
++    };
++  });
++  return {
++    available: true,
++    cards: devices.length,
++    issues,
++    hottestC: temps.length ? Math.max(...temps) : null,
++    byKind,
++    waitingForHardware,
++    devices: compact,
++  };
++}
++
++/** Demo catalog pulse so CPU/RAM dashboards still show add-in cards offline. */
++export function demoAcceleratorSummary(): EnvironmentAcceleratorSummary {
++  return summarizeFromPassThrough(buildAccelerationDashboard().passThrough);
++}
++
++export function hardwareTickerCells(
++  summary: EnvironmentAcceleratorSummary | undefined,
++): HardwareTickerCell[] {
++  const accel = summary ?? emptyAcceleratorSummary();
++  const waiting = accel.waitingForHardware.length
++    ? `waiting ${accel.waitingForHardware.length}`
++    : 'allowlisted PCI';
++  return [
++    {
++      key: 'accelCards',
++      label: 'Accel cards',
++      value: String(accel.cards),
++      sub: accel.cards > 0 ? kindBreakdown(accel.byKind) : waiting,
++    },
++    {
++      key: 'accelIssues',
++      label: 'Accel issues',
++      value: String(accel.issues),
++      sub: accel.issues > 0 ? 'link · AER · driver · IOMMU' : 'no PCI alerts',
++    },
++    {
++      key: 'accelHottestC',
++      label: 'Accel °C',
++      value: accel.hottestC == null ? '—' : `${accel.hottestC}°`,
++      sub: accel.hottestC == null ? 'no hwmon' : 'hottest add-in card',
++    },
++  ];
++}
++
++export function hardwareAddOnTotals(
++  summary: EnvironmentAcceleratorSummary | undefined,
++): HardwareTotal[] {
++  const accel = summary ?? emptyAcceleratorSummary();
++  return [
++    { label: 'Accel', value: String(accel.cards) },
++    { label: 'Accel issues', value: String(accel.issues) },
++    { label: 'Accel °C', value: accel.hottestC == null ? '—' : `${accel.hottestC}°` },
++  ];
++}
+diff --git a/src/lib/telemetry/types.ts b/src/lib/telemetry/types.ts
+index e0547590..f587119c 100644
+--- a/src/lib/telemetry/types.ts
++++ b/src/lib/telemetry/types.ts
+@@ -1,3 +1,5 @@
++import type { EnvironmentAcceleratorSummary } from './hardwareAddOn';
++
+ /**
+  * A metric the node could not measure. The BFF sends `null` rather than a
+  * placeholder number, so `0` always means "measured zero" and never
+@@ -26,6 +28,8 @@ export interface EnvironmentTelemetryPayload {
+   vmCount: number;
+   /** Per-metric provenance, e.g. `{ cpu: 'metrics-server', watts: 'unavailable' }`. */
+   metricSources?: Record<string, string>;
++  /** Allowlisted FPGA / GPU / NPU / TPU pulse collected on the same tick as CPU / RAM. */
++  accelerators?: EnvironmentAcceleratorSummary;
+ }
+ 
+ export interface LiveHealthPayload {
+diff --git a/src/styles.css b/src/styles.css
+index 9b5ce1ec..5dcd8039 100644
+--- a/src/styles.css
++++ b/src/styles.css
+@@ -4814,6 +4814,20 @@ select {
+ .passthrough-list b { color: var(--theme-accent); font-size: 0.76rem; }
+ .passthrough-list em { font-style: normal; font-size: 0.72rem; color: var(--theme-text-dim); }
+ 
++.hardware-addon-panel {
++  margin-top: 0.55rem;
++}
++.holo-tile .hardware-addon-panel {
++  margin: 0;
++  border: none;
++  background: transparent;
++  box-shadow: none;
++  padding: 0;
++}
++.holo-tile .hardware-addon-panel .passthrough-list li {
++  background: color-mix(in srgb, var(--theme-panel) 70%, transparent);
++}
++
+ .spdk-lanes { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+ .spdk-lanes li {
+   border: 1px solid var(--theme-panel-border);
+-- 
+2.43.0
+
