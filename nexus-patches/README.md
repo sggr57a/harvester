@@ -20,13 +20,17 @@ git am 000*.patch
 
 npm install
 npx tsc --noEmit     # clean
-npm run test         # 346 passing (was 328 after the first six; 291 on unpatched main)
+npm run test         # 359 passing (was 346 after 0007–0009; 291 on unpatched main)
 npm run build        # succeeds
 ```
 
 Verified end to end in a fresh clone of `harvester-nexus` at `main` (`1b865a8a`):
 all nine patches apply cleanly with `git am`, `tsc --noEmit` is clean, 346 tests
-pass, and the production build succeeds.
+pass, and the production build succeeds. Patch **0010** is additional work on
+top of 0001–0009: `tsc --noEmit` clean, **359** tests, `npm run build` succeeds.
+On this Cloud Agent node, `memory_tiering.py --discover-only` saw DRAM node 0,
+`memory_tier4`, zswap/DAMON/weighted-interleave/demotion sysfs present, and
+correctly waited for CXL/PMem/NVMe.
 
 ## What each patch does
 
@@ -169,6 +173,30 @@ KubeVirt subresource API (`…/virtualmachineinstances/{name}/vnc` or
 `/console`) or `kubectl exec` for pods. Names are DNS-1123-validated so a
 console URL cannot smuggle flags. The SPA uses noVNC for graphical attach and
 xterm.js on the same websocket for serial/exec. Demo mode is unchanged.
+
+### 0010 — `feat(memory)`: Linux CXL / PMem / zswap / NVMe tiering
+
+The wizard already wrote `nexus.memory_tiering` and
+`nexus.features.memory_tiering=nvme|phase-change`, but the installer never
+consumed those flags. This patch implements the Linux model (not vSphere
+NVMe-as-RAM):
+
+- **CXL Type-3 / memory-only NUMA** — enable `demotion_enabled` and
+  `kernel.numa_balancing=2` (capacity policy) when a slower node exists.
+- **Phase-change / Optane PMem** — bind leftover DAX devices to `dax/kmem`.
+- **HBM** — advertised when the kernel places a CPU-less node in a faster
+  memory tier; otherwise listed under `waitingForHardware`.
+- **zswap + bounded swap file** — last safety net. Never wipes an NVMe
+  namespace. Dedicated unused NVMe is recorded for operators who want a
+  partition.
+- **DAMON, weighted interleave, pghot, CXL pooling, guest CXL/NVDIMM** —
+  probed; applied when sysfs appears, otherwise waiting.
+
+Live Processor & Memory no longer hides behind the demo catalog. It plots
+meminfo, vmstat demote/promote/swap/zswap, PSI, hugepages, and tier
+nodelists, using `null` for counters the kernel does not export.
+
+See `docs/memory-tiering.md` in harvester-nexus after applying the patch.
 
 ## Still outstanding
 
