@@ -1,0 +1,1079 @@
+From 5be79d5055613ca73d9e71487a851e84c96540ed Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 18 Aug 2026 19:53:58 +0000
+Subject: [PATCH 3/3] feat(console): attach live VNC/serial via KubeVirt
+ websocket proxy
+
+The cockpit upgrades /api/v1/console/{vnc,serial,exec} to a WebSocket
+and proxies KubeVirt subresources or kubectl exec. Demo consoles stay
+on demoConsole.ts; live mode no longer pretends the attach happened.
+---
+ AGENTS.md                                     |   4 +-
+ .../overlay/usr/lib/nexus/console_proxy.py    | 429 ++++++++++++++++++
+ .../overlay/usr/lib/nexus/serve-cockpit.py    |  35 ++
+ installer/tests/console-proxy.test.ts         |  77 ++++
+ package-lock.json                             |   7 +
+ package.json                                  |   1 +
+ src/components/ConsoleSession.tsx             | 165 +++++--
+ src/lib/liveConsole.test.ts                   |  51 +++
+ src/lib/liveConsole.ts                        |  38 ++
+ src/novnc.d.ts                                |  10 +
+ src/styles.css                                |   4 +
+ vite.config.ts                                |   3 +
+ 12 files changed, 795 insertions(+), 29 deletions(-)
+ create mode 100644 installer/overlay/usr/lib/nexus/console_proxy.py
+ create mode 100644 installer/tests/console-proxy.test.ts
+ create mode 100644 src/lib/liveConsole.test.ts
+ create mode 100644 src/lib/liveConsole.ts
+ create mode 100644 src/novnc.d.ts
+
+diff --git a/AGENTS.md b/AGENTS.md
+index fdde6fb0..b5592b0e 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -33,7 +33,7 @@ because it has no backend to authenticate against.
+ | Install deps | `npm install` |
+ | Dev server | `npm run dev` (serves on port **4173**) |
+ | Type check | `npx tsc --noEmit` |
+-| Unit tests | `npm run test` (Vitest, 328 tests) |
++| Unit tests | `npm run test` (Vitest) |
+ | Production build | `npm run build` |
+ 
+ ### Key notes
+@@ -45,3 +45,5 @@ because it has no backend to authenticate against.
+ - No ESLint/Prettier is configured; the only lint gate is `tsc --noEmit`.
+ - Playwright scripts under `scripts/` (smoke-shot, record-mockups) are optional and require `npx playwright install chromium` before first use.
+ - **ISO builds on `main`:** every push to `main` runs `.github/workflows/build-iso.yml` and publishes a pre-release ISO under GitHub Releases (`iso-main-<run>`). See `installer/README.md` for download instructions.
++- Live XDR events come from Falco / Tetragon / Suricata / Wazuh pod logs via `xdr_ingest.py`; Kubernetes Warning events keep a derived severity instead of a hardcoded `medium`.
++- Live consoles attach through `console_proxy.py` (`/api/v1/console/{vnc,serial,exec}`) onto KubeVirt subresources or `kubectl exec`. `src/lib/demoConsole.ts` is demo-mode only.
+diff --git a/installer/overlay/usr/lib/nexus/console_proxy.py b/installer/overlay/usr/lib/nexus/console_proxy.py
+new file mode 100644
+index 00000000..783c2a71
+--- /dev/null
++++ b/installer/overlay/usr/lib/nexus/console_proxy.py
+@@ -0,0 +1,429 @@
++#!/usr/bin/env python3
++"""Authenticated WebSocket proxy onto KubeVirt VNC/serial and kubectl exec.
++
++Live consoles used to stop at ``src/lib/demoConsole.ts``. The cockpit now
++upgrades ``/api/v1/console/{vnc,serial,exec}`` to a WebSocket, checks the
++existing bearer/cookie session, and either:
++
++* proxies bytes to the KubeVirt subresource API (``/vnc`` or ``/console``), or
++* attaches ``kubectl exec`` to a pod over a PTY.
++
++Name components are restricted to DNS-1123 labels so a console URL cannot
++smuggle ``kubectl`` flags or path traversal.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import json
++import os
++import re
++import select
++import socket
++import ssl
++import subprocess
++from typing import Any
++from urllib.parse import parse_qs, urlparse
++
++NAME_RE = re.compile(r"^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
++WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
++KUBEVIRT_SUBRESOURCE = {
++    "vnc": "vnc",
++    "serial": "console",
++}
++KUBECONFIG_CANDIDATES = [
++    os.environ.get("KUBECONFIG", ""),
++    "/etc/rancher/rke2/rke2.yaml",
++    "/etc/rancher/k3s/k3s.yaml",
++]
++
++
++def websocket_accept_key(sec_websocket_key: str) -> str:
++    digest = hashlib.sha1((sec_websocket_key.strip() + WS_GUID).encode("ascii")).digest()
++    return base64.b64encode(digest).decode("ascii")
++
++
++def validate_k8s_name(value: str, *, max_len: int = 63) -> str:
++    name = (value or "").strip()
++    if not name or len(name) > max_len or not NAME_RE.match(name):
++        raise ValueError("invalid kubernetes name")
++    return name
++
++
++def find_kubeconfig() -> str | None:
++    for path in KUBECONFIG_CANDIDATES:
++        if path and os.path.isfile(path):
++            return path
++    return None
++
++
++def kubevirt_subresource_path(kind: str, namespace: str, name: str) -> str:
++    sub = KUBEVIRT_SUBRESOURCE.get(kind)
++    if sub is None:
++        raise ValueError("unsupported console kind")
++    ns = validate_k8s_name(namespace, max_len=253)
++    vm = validate_k8s_name(name)
++    return (
++        "/apis/subresources.kubevirt.io/v1/namespaces/%s/virtualmachineinstances/%s/%s"
++        % (ns, vm, sub)
++    )
++
++
++def _b64(data: str) -> bytes:
++    return base64.b64decode(data.encode("ascii"))
++
++
++def load_rest_config(kubeconfig: str) -> dict[str, Any]:
++    """Resolve the current-context API server + credentials via kubectl."""
++    proc = subprocess.run(
++        ["kubectl", "--kubeconfig", kubeconfig, "config", "view", "--raw", "-o", "json"],
++        capture_output=True,
++        text=True,
++        timeout=10,
++        check=False,
++    )
++    if proc.returncode != 0 or not proc.stdout.strip():
++        raise RuntimeError("unable to read kubeconfig")
++    data = json.loads(proc.stdout)
++    current = data.get("current-context") or ""
++    context = next(
++        (c.get("context") or {} for c in data.get("contexts") or [] if c.get("name") == current),
++        {},
++    )
++    cluster_name = context.get("cluster")
++    user_name = context.get("user")
++    cluster = next(
++        (c.get("cluster") or {} for c in data.get("clusters") or [] if c.get("name") == cluster_name),
++        {},
++    )
++    user = next(
++        (u.get("user") or {} for u in data.get("users") or [] if u.get("name") == user_name),
++        {},
++    )
++    server = cluster.get("server") or ""
++    if not server:
++        raise RuntimeError("kube-apiserver URL missing from kubeconfig")
++    return {
++        "server": server,
++        "ca": cluster.get("certificate-authority-data"),
++        "cert": user.get("client-certificate-data"),
++        "key": user.get("client-key-data"),
++        "token": user.get("token"),
++        "insecure": bool(cluster.get("insecure-skip-tls-verify")),
++    }
++
++
++def _ssl_context(rest: dict[str, Any]) -> ssl.SSLContext:
++    if rest.get("insecure"):
++        ctx = ssl._create_unverified_context()  # noqa: SLF001
++    else:
++        ctx = ssl.create_default_context()
++        ca = rest.get("ca")
++        if ca:
++            ctx.load_verify_locations(cadata=_b64(ca).decode("ascii"))
++    cert = rest.get("cert")
++    key = rest.get("key")
++    if cert and key:
++        cert_file = os.path.join("/tmp", "nexus-console-%d.crt" % os.getpid())
++        key_file = os.path.join("/tmp", "nexus-console-%d.key" % os.getpid())
++        with open(cert_file, "wb") as fh:
++            fh.write(_b64(cert))
++        with open(key_file, "wb") as fh:
++            fh.write(_b64(key))
++            os.chmod(key_file, 0o600)
++        ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
++    return ctx
++
++
++def _read_http_headers(sock: socket.socket) -> tuple[str, dict[str, str], bytes]:
++    buf = b""
++    while b"\r\n\r\n" not in buf:
++        chunk = sock.recv(4096)
++        if not chunk:
++            break
++        buf += chunk
++        if len(buf) > 65536:
++            raise RuntimeError("HTTP header too large")
++    head, _, rest = buf.partition(b"\r\n\r\n")
++    lines = head.decode("iso-8859-1").split("\r\n")
++    status = lines[0] if lines else ""
++    headers: dict[str, str] = {}
++    for line in lines[1:]:
++        name, _, value = line.partition(":")
++        if name:
++            headers[name.strip().lower()] = value.strip()
++    return status, headers, rest
++
++
++def connect_kubevirt_websocket(kind: str, namespace: str, name: str, kubeconfig: str | None = None) -> socket.socket:
++    kubeconfig = kubeconfig or find_kubeconfig()
++    if not kubeconfig:
++        raise RuntimeError("kubeconfig not found")
++    rest = load_rest_config(kubeconfig)
++    parsed = urlparse(rest["server"])
++    host = parsed.hostname or "127.0.0.1"
++    port = parsed.port or (443 if parsed.scheme == "https" else 80)
++    path = kubevirt_subresource_path(kind, namespace, name)
++    key = base64.b64encode(os.urandom(16)).decode("ascii")
++    headers = [
++        "GET %s HTTP/1.1" % path,
++        "Host: %s" % (parsed.netloc or host),
++        "Upgrade: websocket",
++        "Connection: Upgrade",
++        "Sec-WebSocket-Key: %s" % key,
++        "Sec-WebSocket-Version: 13",
++        "Sec-WebSocket-Protocol: binary.kubevirt.io",
++    ]
++    if rest.get("token"):
++        headers.append("Authorization: Bearer %s" % rest["token"])
++    raw = socket.create_connection((host, port), timeout=10)
++    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    sock: socket.socket
++    if parsed.scheme == "https":
++        sock = _ssl_context(rest).wrap_socket(raw, server_hostname=host)
++    else:
++        sock = raw
++    sock.sendall(("\r\n".join(headers) + "\r\n\r\n").encode("ascii"))
++    sock.settimeout(15)
++    status, response_headers, leftover = _read_http_headers(sock)
++    if "101" not in status:
++        sock.close()
++        raise RuntimeError("kube-apiserver refused console upgrade: %s" % status)
++    if leftover:
++        # Extremely unusual before the first RFB bytes; stash on the socket via a wrapper.
++        sock = _PrefixedSocket(sock, leftover)
++    expected = websocket_accept_key(key)
++    if response_headers.get("sec-websocket-accept") != expected:
++        # Some kube-apiserver versions still complete the upgrade; continue if 101.
++        pass
++    sock.settimeout(None)
++    return sock
++
++
++class _PrefixedSocket:
++    """Socket-like wrapper that replays bytes received with the HTTP response."""
++
++    def __init__(self, sock: socket.socket, prefix: bytes):
++        self._sock = sock
++        self._prefix = prefix
++
++    def recv(self, nbytes: int) -> bytes:
++        if self._prefix:
++            out, self._prefix = self._prefix[:nbytes], self._prefix[nbytes:]
++            return out
++        return self._sock.recv(nbytes)
++
++    def sendall(self, data: bytes) -> None:
++        self._sock.sendall(data)
++
++    def fileno(self) -> int:
++        return self._sock.fileno()
++
++    def close(self) -> None:
++        self._sock.close()
++
++    def settimeout(self, value: float | None) -> None:
++        self._sock.settimeout(value)
++
++    def shutdown(self, how: int) -> None:
++        self._sock.shutdown(how)
++
++
++def pump_sockets(left: Any, right: Any) -> None:
++    """Copy bytes in both directions until either side closes."""
++    sockets = [left, right]
++    try:
++        while True:
++            readable, _, _ = select.select(sockets, [], [], 60.0)
++            if not readable:
++                continue
++            for src in readable:
++                dst = right if src is left else left
++                data = src.recv(65536)
++                if not data:
++                    return
++                dst.sendall(data)
++    finally:
++        for sock in sockets:
++            try:
++                sock.close()
++            except OSError:
++                pass
++
++
++def encode_ws_text(payload: bytes, *, masked: bool = False) -> bytes:
++    """Encode a single unfragmented text (if utf-8) or binary websocket frame."""
++    try:
++        payload.decode("utf-8")
++        opcode = 0x81
++    except UnicodeDecodeError:
++        opcode = 0x82
++    length = len(payload)
++    header = bytearray([opcode])
++    mask_key = os.urandom(4) if masked else b""
++    if length < 126:
++        header.append((0x80 if masked else 0x00) | length)
++    elif length < 65536:
++        header.append((0x80 if masked else 0x00) | 126)
++        header.extend(length.to_bytes(2, "big"))
++    else:
++        header.append((0x80 if masked else 0x00) | 127)
++        header.extend(length.to_bytes(8, "big"))
++    if masked:
++        header.extend(mask_key)
++        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
++    return bytes(header) + payload
++
++
++def decode_ws_frames(buffer: bytearray) -> tuple[list[bytes], bool]:
++    """Pull complete frames out of ``buffer``. Returns (payloads, closed)."""
++    payloads: list[bytes] = []
++    closed = False
++    while True:
++        if len(buffer) < 2:
++            break
++        b1, b2 = buffer[0], buffer[1]
++        opcode = b1 & 0x0F
++        masked = bool(b2 & 0x80)
++        length = b2 & 0x7F
++        offset = 2
++        if length == 126:
++            if len(buffer) < 4:
++                break
++            length = int.from_bytes(buffer[2:4], "big")
++            offset = 4
++        elif length == 127:
++            if len(buffer) < 10:
++                break
++            length = int.from_bytes(buffer[2:10], "big")
++            offset = 10
++        mask_len = 4 if masked else 0
++        if len(buffer) < offset + mask_len + length:
++            break
++        mask = bytes(buffer[offset : offset + mask_len]) if masked else b""
++        start = offset + mask_len
++        data = bytes(buffer[start : start + length])
++        del buffer[: start + length]
++        if masked:
++            data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
++        if opcode == 0x8:
++            closed = True
++            break
++        if opcode in (0x1, 0x2, 0x0):
++            payloads.append(data)
++        # ping/pong/other control frames are ignored
++    return payloads, closed
++
++
++def attach_pod_exec(namespace: str, name: str, kubeconfig: str | None = None, command: str = "/bin/sh") -> subprocess.Popen:
++    kubeconfig = kubeconfig or find_kubeconfig()
++    if not kubeconfig:
++        raise RuntimeError("kubeconfig not found")
++    ns = validate_k8s_name(namespace, max_len=253)
++    pod = validate_k8s_name(name)
++    # Only a shell path, never a caller-supplied argument list.
++    if command not in ("/bin/sh", "/bin/bash", "sh", "bash"):
++        command = "/bin/sh"
++    return subprocess.Popen(
++        [
++            "kubectl",
++            "--kubeconfig", kubeconfig,
++            "exec",
++            "-n", ns,
++            "-i",
++            "-t",
++            pod,
++            "--",
++            command,
++        ],
++        stdin=subprocess.PIPE,
++        stdout=subprocess.PIPE,
++        stderr=subprocess.STDOUT,
++        bufsize=0,
++    )
++
++
++def parse_console_request(path: str) -> tuple[str, str, str]:
++    parsed = urlparse(path)
++    kind = parsed.path.rstrip("/").rsplit("/", 1)[-1]
++    if kind not in ("vnc", "serial", "exec"):
++        raise ValueError("unsupported console kind")
++    query = parse_qs(parsed.query)
++    namespace = (query.get("namespace") or [""])[0]
++    name = (query.get("name") or [""])[0]
++    validate_k8s_name(namespace, max_len=253)
++    validate_k8s_name(name)
++    return kind, namespace, name
++
++
++def handle_browser_upgrade(handler, kind: str, namespace: str, name: str) -> None:
++    """Complete the browser WebSocket handshake and attach the backend.
++
++    The upstream attach happens *before* the 101 so a missing VMI or kubeconfig
++    can still surface as an HTTP error instead of a half-open socket.
++    """
++    key = handler.headers.get("Sec-WebSocket-Key")
++    if not key:
++        handler._plain(400, b"missing Sec-WebSocket-Key")
++        return
++    upstream = None
++    proc = None
++    if kind in ("vnc", "serial"):
++        upstream = connect_kubevirt_websocket(kind, namespace, name)
++    else:
++        proc = attach_pod_exec(namespace, name)
++    handler.send_response(101, "Switching Protocols")
++    handler.send_header("Upgrade", "websocket")
++    handler.send_header("Connection", "Upgrade")
++    handler.send_header("Sec-WebSocket-Accept", websocket_accept_key(key))
++    handler.end_headers()
++    handler.wfile.flush()
++    handler.close_connection = True
++    client = handler.connection
++    try:
++        client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    except OSError:
++        pass
++    if upstream is not None:
++        pump_sockets(client, upstream)
++        return
++    if proc is not None:
++        _pump_exec(client, proc)
++
++
++def _pump_exec(client: socket.socket, proc: subprocess.Popen) -> None:
++    """Bridge decoded browser frames to kubectl exec stdio."""
++    buffer = bytearray()
++    stdout = proc.stdout
++    stdin = proc.stdin
++    assert stdout is not None and stdin is not None
++    try:
++        while True:
++            fds = [client, stdout]
++            readable, _, _ = select.select(fds, [], [], 60.0)
++            if client in readable:
++                chunk = client.recv(65536)
++                if not chunk:
++                    break
++                buffer.extend(chunk)
++                payloads, closed = decode_ws_frames(buffer)
++                for payload in payloads:
++                    stdin.write(payload)
++                    stdin.flush()
++                if closed:
++                    break
++            if stdout in readable:
++                data = stdout.read(4096)
++                if not data:
++                    break
++                client.sendall(encode_ws_text(data if isinstance(data, bytes) else data.encode("utf-8")))
++    finally:
++        try:
++            proc.terminate()
++        except OSError:
++            pass
++        try:
++            client.close()
++        except OSError:
++            pass
+diff --git a/installer/overlay/usr/lib/nexus/serve-cockpit.py b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+index fe08d5a7..8ad4d32a 100644
+--- a/installer/overlay/usr/lib/nexus/serve-cockpit.py
++++ b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+@@ -27,6 +27,7 @@ RESOURCES_MODULE = os.path.join(os.path.dirname(__file__), "cluster_resources.py
+ OVS_MODULE = os.path.join(os.path.dirname(__file__), "ovs_operations.py")
+ AUTH_MODULE = os.path.join(os.path.dirname(__file__), "cockpit_auth.py")
+ ANYRAID_MODULE = os.path.join(os.path.dirname(__file__), "anyraid_provisioner.py")
++CONSOLE_MODULE = os.path.join(os.path.dirname(__file__), "console_proxy.py")
+ 
+ # Endpoints reachable without a session. Everything else under /api/v1
+ # requires a valid bearer token or session cookie.
+@@ -66,6 +67,10 @@ def _load_anyraid():
+     return _load_module(ANYRAID_MODULE, "nexus_anyraid_provisioner")
+ 
+ 
++def _load_console():
++    return _load_module(CONSOLE_MODULE, "nexus_console_proxy")
++
++
+ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+     def __init__(
+         self,
+@@ -78,6 +83,7 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+         credentials=None,
+         sessions=None,
+         anyraid=None,
++        console=None,
+         tls_enabled=False,
+         **kwargs,
+     ):
+@@ -89,6 +95,7 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+         self._credentials = credentials
+         self._sessions = sessions
+         self._anyraid = anyraid
++        self._console = console
+         self._tls_enabled = tls_enabled
+         self._pending_cookie = None
+         self._clear_cookie = False
+@@ -138,6 +145,11 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             if path not in PUBLIC_PATHS and not self._require_auth():
+                 return
+ 
++        if path.startswith("/api/v1/console/") and self._console is not None:
++            if self._console.is_websocket_request(self.headers):
++                self._handle_console_upgrade(path)
++                return
++
+         if path == "/api/v1/health/live":
+             self._json_api(self._handle_live_health)
+             return
+@@ -348,6 +360,22 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             return {"exists": False, "error": "AnyRAID provisioner unavailable"}
+         return self._anyraid.pool_status()
+ 
++    def _handle_console_upgrade(self, path: str) -> None:
++        if self._console is None:
++            self._plain(503, b"console proxy unavailable")
++            return
++        try:
++            kind, namespace, name = self._console.parse_console_request(path)
++            self._console.handle_browser_upgrade(self, kind, namespace, name)
++        except ValueError as exc:
++            self._plain(400, str(exc).encode("utf-8"))
++        except Exception as exc:  # noqa: BLE001
++            if not self.wfile.closed:
++                try:
++                    self._plain(503, str(exc).encode("utf-8"))
++                except Exception:  # noqa: BLE001
++                    return
++
+     def _handle_apply_manifest(self) -> dict:
+         if self._resources is None:
+             raise RuntimeError("resource apply unavailable")
+@@ -471,6 +499,12 @@ def main() -> int:
+         sys.stderr.write("nexus-cockpit: AnyRAID provisioner disabled: %s\n" % exc)
+         anyraid = None
+ 
++    try:
++        console = _load_console()
++    except Exception as exc:  # noqa: BLE001
++        sys.stderr.write("nexus-cockpit: console proxy disabled: %s\n" % exc)
++        console = None
++
+     # Authentication is mandatory: every /api/v1 route other than login and
+     # session discovery mutates or exposes cluster state, so the cockpit
+     # refuses to serve at all if the credential store cannot be initialised.
+@@ -501,6 +535,7 @@ def main() -> int:
+         "credentials": credentials,
+         "sessions": sessions,
+         "anyraid": anyraid,
++        "console": console,
+     }
+ 
+     if os.path.isfile(TLS_CRT) and os.path.isfile(TLS_KEY):
+diff --git a/installer/tests/console-proxy.test.ts b/installer/tests/console-proxy.test.ts
+new file mode 100644
+index 00000000..5471fb95
+--- /dev/null
++++ b/installer/tests/console-proxy.test.ts
+@@ -0,0 +1,77 @@
++/**
++ * Contract tests for installer/overlay/usr/lib/nexus/console_proxy.py.
++ */
++
++import { execFileSync } from 'node:child_process';
++import { resolve } from 'node:path';
++import { describe, expect, it } from 'vitest';
++
++const MODULE = resolve(__dirname, '../overlay/usr/lib/nexus/console_proxy.py');
++
++function py<T>(snippet: string): T {
++  const script = [
++    'import importlib.util, json, sys',
++    `spec = importlib.util.spec_from_file_location("c", ${JSON.stringify(MODULE)})`,
++    'c = importlib.util.module_from_spec(spec)',
++    'spec.loader.exec_module(c)',
++    snippet,
++  ].join('\n');
++  const out = execFileSync('python3', ['-c', script], { encoding: 'utf-8' });
++  return JSON.parse(out) as T;
++}
++
++describe('console_proxy', () => {
++  it('uses the RFC 6455 WebSocket accept key', () => {
++    const result = py<{ accept: string }>(
++      'print(json.dumps({"accept": c.websocket_accept_key("dGhlIHNhbXBsZSBub25jZQ==")}))',
++    );
++    expect(result.accept).toBe('s3pPLMBiTxaQ9kYGzzhZRbK+xOo=');
++  });
++
++  it('builds KubeVirt VNC and serial subresource paths', () => {
++    const result = py<{ vnc: string; serial: string }>(
++      [
++        'print(json.dumps({',
++        '  "vnc": c.kubevirt_subresource_path("vnc", "tenant-apps", "payments-vm"),',
++        '  "serial": c.kubevirt_subresource_path("serial", "tenant-apps", "payments-vm"),',
++        '}))',
++      ].join('\n'),
++    );
++    expect(result.vnc).toBe(
++      '/apis/subresources.kubevirt.io/v1/namespaces/tenant-apps/virtualmachineinstances/payments-vm/vnc',
++    );
++    expect(result.serial).toBe(
++      '/apis/subresources.kubevirt.io/v1/namespaces/tenant-apps/virtualmachineinstances/payments-vm/console',
++    );
++  });
++
++  it('rejects console names that look like flags or paths', () => {
++    const result = py<{ flag: boolean; path: boolean; ok: boolean }>(
++      [
++        'def bad(value):',
++        '    try:',
++        '        c.validate_k8s_name(value)',
++        '        return False',
++        '    except ValueError:',
++        '        return True',
++        'print(json.dumps({"flag": bad("--namespace"), "path": bad("../etc"), "ok": c.validate_k8s_name("payments-vm") == "payments-vm"}))',
++      ].join('\n'),
++    );
++    expect(result.flag).toBe(true);
++    expect(result.path).toBe(true);
++    expect(result.ok).toBe(true);
++  });
++
++  it('round-trips a websocket text frame', () => {
++    const result = py<{ payload: string; closed: boolean }>(
++      [
++        'frame = c.encode_ws_text(b"hello console", masked=True)',
++        'buf = bytearray(frame)',
++        'payloads, closed = c.decode_ws_frames(buf)',
++        'print(json.dumps({"payload": payloads[0].decode(), "closed": closed}))',
++      ].join('\n'),
++    );
++    expect(result.payload).toBe('hello console');
++    expect(result.closed).toBe(false);
++  });
++});
+diff --git a/package-lock.json b/package-lock.json
+index 3bf16bd2..7969e742 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -11,6 +11,7 @@
+         "@codemirror/lang-yaml": "^6.1.3",
+         "@codemirror/theme-one-dark": "^6.1.3",
+         "@codemirror/view": "^6.43.0",
++        "@novnc/novnc": "^1.5.0",
+         "@uiw/react-codemirror": "^4.25.10",
+         "@xterm/addon-fit": "^0.10.0",
+         "@xterm/xterm": "^5.5.0",
+@@ -1017,6 +1018,12 @@
+         "@emnapi/runtime": "^1.7.1"
+       }
+     },
++    "node_modules/@novnc/novnc": {
++      "version": "1.7.0",
++      "resolved": "https://registry.npmjs.org/@novnc/novnc/-/novnc-1.7.0.tgz",
++      "integrity": "sha512-ucEJOx4T2avIRCleodk7YobZj5O2Ga2AeLfQ69A/yjG9HHba2+PDgwSkN3FttrmG+70ZGx21sElNFouK13RzyA==",
++      "license": "MPL-2.0"
++    },
+     "node_modules/@oxc-project/types": {
+       "version": "0.132.0",
+       "resolved": "https://registry.npmjs.org/@oxc-project/types/-/types-0.132.0.tgz",
+diff --git a/package.json b/package.json
+index dc41a2b6..d1e7a537 100644
+--- a/package.json
++++ b/package.json
+@@ -14,6 +14,7 @@
+     "@codemirror/theme-one-dark": "^6.1.3",
+     "@codemirror/view": "^6.43.0",
+     "@uiw/react-codemirror": "^4.25.10",
++    "@novnc/novnc": "^1.5.0",
+     "@xterm/addon-fit": "^0.10.0",
+     "@xterm/xterm": "^5.5.0",
+     "react": "^18.3.1",
+diff --git a/src/components/ConsoleSession.tsx b/src/components/ConsoleSession.tsx
+index 65a7ea2b..9d3a9331 100644
+--- a/src/components/ConsoleSession.tsx
++++ b/src/components/ConsoleSession.tsx
+@@ -1,9 +1,10 @@
+-import { useEffect, useRef } from 'react';
++import { useEffect, useRef, useState } from 'react';
+ import { Terminal } from '@xterm/xterm';
+ import { FitAddon } from '@xterm/addon-fit';
+ import '@xterm/xterm/css/xterm.css';
+ import type { ConsoleChip, MachineRow } from '../lib/dashboards';
+ import { createDemoGraphicalSession, createDemoShellSession } from '../lib/demoConsole';
++import { consoleWebSocketUrl, liveConsoleKind } from '../lib/liveConsole';
+ import { describeConsole } from '../lib/machineConsole';
+ import type { TelemetryDataSource } from '../lib/telemetry/dashboardAdapters';
+ 
+@@ -66,48 +67,137 @@ function GraphicalConsoleMock({ machine }: { machine: MachineRow }) {
+   );
+ }
+ 
++function LiveVncConsole({ url }: { url: string }) {
++  const hostRef = useRef<HTMLDivElement>(null);
++  const [status, setStatus] = useState('Connecting to KubeVirt VNC…');
++
++  useEffect(() => {
++    const host = hostRef.current;
++    if (!host) return undefined;
++    let disconnected = false;
++    let rfb: { disconnect: () => void } | null = null;
++
++    void import('@novnc/novnc').then((mod) => {
++      if (disconnected || !hostRef.current) return;
++      const RFB = mod.default;
++      const session = new RFB(hostRef.current, url, { wsProtocols: [] });
++      session.scaleViewport = true;
++      session.resizeSession = true;
++      session.addEventListener('connect', () => setStatus('KubeVirt VNC connected'));
++      session.addEventListener('disconnect', () => setStatus('VNC disconnected'));
++      session.addEventListener('securityfailure', () => setStatus('VNC authentication failed'));
++      rfb = session;
++    }).catch(() => {
++      setStatus('noVNC is not available in this build');
++    });
++
++    return () => {
++      disconnected = true;
++      rfb?.disconnect();
++    };
++  }, [url]);
++
++  return (
++    <div className="live-vnc-console">
++      <div className="live-vnc-status">{status}</div>
++      <div className="live-vnc-host" ref={hostRef} />
++    </div>
++  );
++}
++
++function useLiveTerminal(url: string | null, banner: string, enabled: boolean) {
++  const termRef = useRef<HTMLDivElement>(null);
++  const [status, setStatus] = useState<string | null>(null);
++
++  useEffect(() => {
++    if (!enabled || !url || !termRef.current) return undefined;
++    const term = new Terminal({
++      cursorBlink: true,
++      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
++      fontSize: 13,
++      theme: { background: '#0a0f14', foreground: '#c8e6ff', cursor: '#5eead4' },
++    });
++    const fit = new FitAddon();
++    term.loadAddon(fit);
++    term.open(termRef.current);
++    fit.fit();
++    term.writeln(banner);
++
++    const socket = new WebSocket(url);
++    socket.binaryType = 'arraybuffer';
++    socket.onopen = () => {
++      setStatus('connected');
++      term.writeln('\r\n[live] attached to cluster console websocket');
++    };
++    socket.onerror = () => {
++      setStatus('error');
++      term.writeln('\r\n[live] websocket error — is the cockpit BFF serving /api/v1/console/* ?');
++    };
++    socket.onclose = () => {
++      setStatus('closed');
++      term.writeln('\r\n[live] console disconnected');
++    };
++    socket.onmessage = (event) => {
++      if (typeof event.data === 'string') {
++        term.write(event.data);
++        return;
++      }
++      term.write(new Uint8Array(event.data as ArrayBuffer));
++    };
++    term.onData((data) => {
++      if (socket.readyState === WebSocket.OPEN) socket.send(data);
++    });
++
++    const onResize = () => fit.fit();
++    window.addEventListener('resize', onResize);
++    return () => {
++      window.removeEventListener('resize', onResize);
++      socket.close();
++      term.dispose();
++    };
++  }, [banner, enabled, url]);
++
++  return { termRef, status };
++}
++
+ export function ConsoleSession({ machine, chip, dataSource, onClose }: ConsoleSessionProps) {
+   const info = describeConsole(machine, chip.type);
+   const isLive = dataSource === 'live';
+-  const termRef = useRef<HTMLDivElement>(null);
+-  const xtermRef = useRef<Terminal | null>(null);
+-  const lineBufferRef = useRef('');
++  const liveKind = isLive ? liveConsoleKind(machine, chip) : null;
++  const resolvedUrl = isLive && liveKind
++    ? consoleWebSocketUrl(liveKind, machine.namespace || 'default', machine.name)
++    : null;
++
++  const demoTermRef = useRef<HTMLDivElement>(null);
+   const sessionRef = useRef(createDemoShellSession(machine));
++  const lineBufferRef = useRef('');
++  const liveTerminal = useLiveTerminal(
++    resolvedUrl,
++    `Nexus live console — ${machine.kind} · ${machine.name}`,
++    Boolean(isLive && liveKind && liveKind !== 'vnc' && info.presentation !== 'graphical'),
++  );
+ 
+   useEffect(() => {
+-    if (info.presentation === 'graphical' || !termRef.current) return undefined;
+-
++    if (isLive || info.presentation === 'graphical' || !demoTermRef.current) return undefined;
+     const term = new Terminal({
+       cursorBlink: true,
+       fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+       fontSize: 13,
+-      theme: {
+-        background: '#0a0f14',
+-        foreground: '#c8e6ff',
+-        cursor: '#5eead4',
+-      },
++      theme: { background: '#0a0f14', foreground: '#c8e6ff', cursor: '#5eead4' },
+     });
+     const fit = new FitAddon();
+     term.loadAddon(fit);
+-    term.open(termRef.current);
++    term.open(demoTermRef.current);
+     fit.fit();
+-    xtermRef.current = term;
+-
+     const session = sessionRef.current;
+     lineBufferRef.current = '';
+     term.writeln(session.banner);
+     term.write(session.prompt);
+-
+-    if (isLive) {
+-      term.writeln('\r\n[live] kubectl exec / virtctl console would attach here on Harvester node.');
+-      term.writeln('[live] Demo terminal shown until console BFF WebSocket is connected.');
+-    }
+-
+     term.onData((data) => {
+       if (data === '\r') {
+         term.write('\r\n');
+         const lines = session.handleLine(lineBufferRef.current);
+-        lines.forEach((l) => term.writeln(l));
++        lines.forEach((line) => term.writeln(line));
+         lineBufferRef.current = '';
+         term.write(session.prompt);
+         return;
+@@ -122,16 +212,21 @@ export function ConsoleSession({ machine, chip, dataSource, onClose }: ConsoleSe
+       lineBufferRef.current += data;
+       term.write(data);
+     });
+-
+     const onResize = () => fit.fit();
+     window.addEventListener('resize', onResize);
+     return () => {
+       window.removeEventListener('resize', onResize);
+       term.dispose();
+-      xtermRef.current = null;
+     };
+   }, [info.presentation, isLive, machine.id]);
+ 
++  const showLiveVnc = isLive && liveKind === 'vnc';
++  const showLiveSerial = isLive && liveKind !== null && liveKind !== 'vnc' && info.presentation !== 'graphical';
++  const showDemoGraphical = !isLive && info.presentation === 'graphical';
++  const showLiveGraphicalFallback = isLive && info.presentation === 'graphical' && liveKind !== 'vnc';
++  const showDemoShell = !isLive && info.presentation !== 'graphical';
++  const showLiveUnavailable = isLive && liveKind === null;
++
+   return (
+     <div className="console-session-overlay" role="dialog" aria-label={`Console ${machine.name}`}>
+       <div className="console-session-panel">
+@@ -139,16 +234,30 @@ export function ConsoleSession({ machine, chip, dataSource, onClose }: ConsoleSe
+           <div>
+             <span className="dash-kicker">CONSOLE // {info.presentation.toUpperCase()}</span>
+             <h3>{machine.name}</h3>
+-            <p>{info.hint}</p>
++            <p>
++              {isLive && liveKind
++                ? `Live ${liveKind} attach via cockpit /api/v1/console/${liveKind}`
++                : info.hint}
++            </p>
+           </div>
+           <button type="button" className="ghost-btn" onClick={onClose}>
+             Disconnect
+           </button>
+         </header>
+-        {info.presentation === 'graphical' ? (
+-          <GraphicalConsoleMock machine={machine} />
+-        ) : (
+-          <div className="console-terminal-host" ref={termRef} />
++        {showLiveVnc && resolvedUrl && <LiveVncConsole url={resolvedUrl} />}
++        {showLiveSerial && <div className="console-terminal-host" ref={liveTerminal.termRef} />}
++        {showDemoGraphical && <GraphicalConsoleMock machine={machine} />}
++        {showLiveGraphicalFallback && (
++          <div className="console-live-unavailable">
++            Graphical consoles attach through KubeVirt VNC. This {machine.kind} has no VMI subresource.
++          </div>
++        )}
++        {showDemoShell && <div className="console-terminal-host" ref={demoTermRef} />}
++        {showLiveUnavailable && (
++          <div className="console-live-unavailable">
++            No KubeVirt VNC/serial or kubectl exec target for {machine.kind} {machine.name}.
++            Nodes do not expose a guest console through this API.
++          </div>
+         )}
+       </div>
+     </div>
+diff --git a/src/lib/liveConsole.test.ts b/src/lib/liveConsole.test.ts
+new file mode 100644
+index 00000000..b881c511
+--- /dev/null
++++ b/src/lib/liveConsole.test.ts
+@@ -0,0 +1,51 @@
++import { describe, expect, it } from 'vitest';
++import { buildConsolePath, consoleWebSocketUrl, isDns1123Label, liveConsoleKind } from './liveConsole';
++import type { ConsoleChip, MachineRow } from './dashboards';
++
++const vm: MachineRow = {
++  id: 'vm-1',
++  name: 'payments-vm',
++  kind: 'vm',
++  host: 'node-1',
++  namespace: 'tenant-apps',
++  cpuPercent: 10,
++  ramGiB: 4,
++  ramAllocGiB: 4,
++  status: 'running',
++  haEnabled: true,
++  affinity: 'none',
++};
++
++const vncChip: ConsoleChip = {
++  id: 'vm-1-vnc',
++  type: 'novnc',
++  target: 'payments-vm',
++  machineId: 'vm-1',
++  namespace: 'tenant-apps',
++  kind: 'vm',
++  state: 'idle',
++};
++
++describe('liveConsole', () => {
++  it('builds a KubeVirt VNC websocket path', () => {
++    expect(liveConsoleKind(vm, vncChip)).toBe('vnc');
++    expect(buildConsolePath('vnc', 'tenant-apps', 'payments-vm')).toBe(
++      '/api/v1/console/vnc?namespace=tenant-apps&name=payments-vm',
++    );
++    expect(
++      consoleWebSocketUrl('serial', 'tenant-apps', 'payments-vm', { protocol: 'https:', host: 'nexus.example:8443' }),
++    ).toBe('wss://nexus.example:8443/api/v1/console/serial?namespace=tenant-apps&name=payments-vm');
++  });
++
++  it('rejects names that could smuggle kubectl flags', () => {
++    expect(isDns1123Label('--namespace')).toBe(false);
++    expect(isDns1123Label('../etc')).toBe(false);
++    expect(() => buildConsolePath('vnc', 'ok', '--foo')).toThrow(/invalid/);
++  });
++
++  it('uses kubectl exec for running pods', () => {
++    const pod: MachineRow = { ...vm, kind: 'pod', name: 'api-green', id: 'pod-1' };
++    const chip: ConsoleChip = { ...vncChip, type: 'xterm', id: 'pod-1-shell', kind: 'pod' };
++    expect(liveConsoleKind(pod, chip)).toBe('exec');
++  });
++});
+diff --git a/src/lib/liveConsole.ts b/src/lib/liveConsole.ts
+new file mode 100644
+index 00000000..ef6301a0
+--- /dev/null
++++ b/src/lib/liveConsole.ts
+@@ -0,0 +1,38 @@
++import type { ConsoleChip, MachineRow } from './dashboards';
++
++export type LiveConsoleKind = 'vnc' | 'serial' | 'exec';
++
++const NAME_RE = /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/;
++
++export function isDns1123Label(value: string, maxLen = 63): boolean {
++  return Boolean(value) && value.length <= maxLen && NAME_RE.test(value);
++}
++
++export function liveConsoleKind(machine: MachineRow, chip: ConsoleChip): LiveConsoleKind | null {
++  if (machine.kind === 'vm' && machine.namespace && isDns1123Label(machine.namespace, 253) && isDns1123Label(machine.name)) {
++    if (chip.type === 'novnc') return 'vnc';
++    return 'serial';
++  }
++  if ((machine.kind === 'pod' || machine.kind === 'lxc' || machine.kind === 'docker') && machine.namespace) {
++    if (isDns1123Label(machine.namespace, 253) && isDns1123Label(machine.name)) return 'exec';
++  }
++  return null;
++}
++
++export function buildConsolePath(kind: LiveConsoleKind, namespace: string, name: string): string {
++  if (!isDns1123Label(namespace, 253) || !isDns1123Label(name)) {
++    throw new Error('invalid console target');
++  }
++  const query = new URLSearchParams({ namespace, name });
++  return `/api/v1/console/${kind}?${query.toString()}`;
++}
++
++export function consoleWebSocketUrl(
++  kind: LiveConsoleKind,
++  namespace: string,
++  name: string,
++  location: Pick<Location, 'protocol' | 'host'> = window.location,
++): string {
++  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
++  return `${proto}//${location.host}${buildConsolePath(kind, namespace, name)}`;
++}
+diff --git a/src/novnc.d.ts b/src/novnc.d.ts
+new file mode 100644
+index 00000000..ccf3a4cb
+--- /dev/null
++++ b/src/novnc.d.ts
+@@ -0,0 +1,10 @@
++declare module '@novnc/novnc' {
++  export default class RFB {
++    constructor(target: HTMLElement, url: string | URL, options?: Record<string, unknown>);
++    scaleViewport: boolean;
++    resizeSession: boolean;
++    disconnect(): void;
++    addEventListener(type: string, listener: EventListener): void;
++    removeEventListener(type: string, listener: EventListener): void;
++  }
++}
+diff --git a/src/styles.css b/src/styles.css
+index 5c67459d..de310bdf 100644
+--- a/src/styles.css
++++ b/src/styles.css
+@@ -14908,6 +14908,10 @@ select option {
+   padding: 0.75rem 1rem; border-bottom: 1px solid var(--theme-border);
+ }
+ .console-terminal-host { flex: 1; min-height: 360px; padding: 0.25rem; background: #0a0f14; }
++.live-vnc-console { flex: 1; display: flex; flex-direction: column; min-height: 360px; background: #111; }
++.live-vnc-status { padding: 0.35rem 0.75rem; font-size: 0.75rem; color: var(--theme-text-dim); border-bottom: 1px solid var(--theme-border); }
++.live-vnc-host { flex: 1; min-height: 320px; background: #000; }
++.console-live-unavailable { padding: 1.5rem; color: var(--theme-text-dim); font-size: 0.9rem; }
+ 
+ .graphical-console-mock { flex: 1; display: flex; flex-direction: column; min-height: 360px; }
+ .graphical-console-bar { padding: 0.5rem 0.75rem; background: var(--theme-panel-2); border-bottom: 1px solid var(--theme-border); display: flex; flex-direction: column; gap: 0.15rem; font-size: 0.8rem; }
+diff --git a/vite.config.ts b/vite.config.ts
+index 7a7b363c..b979c415 100644
+--- a/vite.config.ts
++++ b/vite.config.ts
+@@ -6,4 +6,7 @@ export default defineConfig({
+   server: {
+     port: 4173,
+   },
++  build: {
++    target: 'es2022',
++  },
+ });
+-- 
+2.43.0
+
