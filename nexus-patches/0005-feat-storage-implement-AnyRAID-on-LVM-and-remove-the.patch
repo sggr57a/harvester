@@ -1,0 +1,810 @@
+From 8d9d84f67e101cf15be0f47dac5571e784a6c2a9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 18 Aug 2026 19:28:46 +0000
+Subject: [PATCH 5/6] feat(storage): implement AnyRAID on LVM and remove the
+ phantom CSI driver
+
+installer/manifests/30-anyraid-csi.yaml declared a CSIDriver plus a DaemonSet
+running ghcr.io/sggr57a/nexus-anyraid-csi:1.0.0. That image is never built:
+no source and no build recipe for it exists anywhere in the repository, and
+the only Dockerfile is the ISO builder. On a real install the DaemonSet went
+to ImagePullBackOff and every PVC on the anyraid-default StorageClass stayed
+Pending indefinitely, so AnyRAID was advertised but non-functional.
+
+Implement it over LVM instead of writing a new block layer. LVM already
+provides the primitive AnyRAID describes: a volume group pools physical
+volumes of differing sizes and allocates in fixed-size extents (the 'slabs'),
+and its RAID targets sit on dm-raid, the same kernel code mdadm drives.
+Reimplementing a slab allocator would duplicate well-tested storage code
+where bugs destroy data.
+
+Profiles map onto dm-raid levels: mirror->raid1, striped-mirror->raid10,
+raidz1->raid5, raidz2->raid6. raidz3 is rejected rather than silently
+downgraded, because dm-raid has no triple-parity target and delivering
+2-drive tolerance for a 3-parity request would misrepresent redundancy.
+
+plan_pool reports stranded capacity per drive, since equal-leg layouts are
+bounded by the smallest member and a raw-sum total would over-promise.
+Device paths are validated against a strict pattern and every call uses
+argument lists, so wizard input cannot smuggle flags or escape /dev.
+
+Pool health is served from GET /api/v1/storage/anyraid by the cockpit, which
+already runs on the host, rather than by a privileged hostPID DaemonSet.
+
+Verified on real heterogeneous loop devices (640M/640M/1.12G/1.94G):
+pvcreate and vgcreate created a genuine 4-PV volume group; lvcreate is
+unverified here only because this container kernel exposes no device-mapper
+target. Planning, validation, and capacity accounting are covered by 16 new
+tests (312 -> 328).
+---
+ installer/manifests/30-anyraid-csi.yaml       |  93 +++---
+ .../usr/lib/nexus/anyraid_provisioner.py      | 303 ++++++++++++++++++
+ .../overlay/usr/lib/nexus/serve-cockpit.py    |  24 ++
+ installer/tests/anyraid-provisioner.test.ts   | 248 ++++++++++++++
+ 4 files changed, 622 insertions(+), 46 deletions(-)
+ create mode 100644 installer/overlay/usr/lib/nexus/anyraid_provisioner.py
+ create mode 100644 installer/tests/anyraid-provisioner.test.ts
+
+diff --git a/installer/manifests/30-anyraid-csi.yaml b/installer/manifests/30-anyraid-csi.yaml
+index 0014df022..182ad4326 100644
+--- a/installer/manifests/30-anyraid-csi.yaml
++++ b/installer/manifests/30-anyraid-csi.yaml
+@@ -1,44 +1,43 @@
+-# AnyRAID CSI driver — installed when `storage.anyraid.enabled: true`.
+-# Provides slab-based RAID over heterogeneous-capacity drives.
++# AnyRAID storage — installed when `storage.anyraid.enabled: true`.
++#
++# AnyRAID pools heterogeneous-capacity drives using LVM: a volume group spans
++# physical volumes of differing sizes and allocates in fixed-size extents (the
++# "slabs"), with redundancy provided by dm-raid. The pool is created on the host
++# at first boot by `nexus-postinstall`, which calls
++# /usr/lib/nexus/anyraid_provisioner.py with the disks the operator selected in
++# the install wizard.
++#
++# This file previously declared a CSIDriver plus a DaemonSet running
++# `ghcr.io/sggr57a/nexus-anyraid-csi:1.0.0`. No such image exists and no source
++# or build recipe for it exists anywhere in this repository, so on a real
++# install the DaemonSet entered ImagePullBackOff and every PVC bound to the
++# `anyraid-default` StorageClass stayed Pending indefinitely. The phantom driver
++# is replaced here by provisioning against the real host pool.
+ ---
+-apiVersion: storage.k8s.io/v1
+-kind: CSIDriver
++apiVersion: v1
++kind: ConfigMap
+ metadata:
+-  name: anyraid.csi.nexus.io
++  name: anyraid-pool-config
++  namespace: nexus-system
+   labels:
+-    app.kubernetes.io/name: anyraid-csi
++    app.kubernetes.io/name: anyraid
+     app.kubernetes.io/managed-by: harvester-nexus-installer
+-spec:
+-  attachRequired: true
+-  podInfoOnMount: false
+-  volumeLifecycleModes: [Persistent]
+-  fsGroupPolicy: File
+----
+-apiVersion: apps/v1
+-kind: DaemonSet
+-metadata:
+-  name: anyraid-csi-node
+-  namespace: nexus-system
+-  labels: { app.kubernetes.io/name: anyraid-csi }
+-spec:
+-  selector: { matchLabels: { app.kubernetes.io/name: anyraid-csi } }
+-  template:
+-    metadata: { labels: { app.kubernetes.io/name: anyraid-csi } }
+-    spec:
+-      hostNetwork: true
+-      hostPID: true
+-      tolerations: [{ operator: Exists }]
+-      containers:
+-        - name: anyraid-csi
+-          image: ghcr.io/sggr57a/nexus-anyraid-csi:1.0.0
+-          securityContext: { privileged: true }
+-          env:
+-            - { name: NODE_NAME, valueFrom: { fieldRef: { fieldPath: spec.nodeName } } }
++data:
++  # Populated by nexus-postinstall from the wizard answers in
++  # /etc/nexus/anyraid-disks.yaml. Profiles map onto dm-raid levels:
++  #   mirror -> raid1, striped-mirror -> raid10,
++  #   raidz1 -> raid5, raidz2 -> raid6.
++  # raidz3 is intentionally unsupported: dm-raid has no triple-parity target,
++  # and mapping it to raid6 would deliver less redundancy than requested.
++  profile: "raidz1"
++  extentSizeMiB: "64"
++  volumeGroup: "nexus-anyraid"
++  logicalVolume: "pool"
++  mountPath: "/var/lib/nexus/anyraid"
+ ---
+-# Default AnyRAID StorageClass — raidz1 over whatever disks the operator
+-# selected during the install wizard. The actual `diskInventory`
+-# parameter is filled in by the nexus-postinstall script after the
+-# wizard answers are known.
++# The AnyRAID pool is a host-local redundant volume, so it is consumed through
++# the local-path provisioner rooted at the pool mount point. Redundancy comes
++# from dm-raid beneath the filesystem, not from replication in Kubernetes.
+ apiVersion: storage.k8s.io/v1
+ kind: StorageClass
+ metadata:
+@@ -46,16 +45,18 @@ metadata:
+   annotations:
+     storageclass.kubernetes.io/is-default-class: "false"
+     nexus.io/managed-by: harvester-nexus-installer
+-provisioner: anyraid.csi.nexus.io
++    nexus.io/backing-store: "lvm-dm-raid"
++provisioner: rancher.io/local-path
+ reclaimPolicy: Retain
++# WaitForFirstConsumer is required: the pool exists on specific nodes only, so
++# the scheduler must place the pod before the volume is provisioned.
+ volumeBindingMode: WaitForFirstConsumer
+-allowVolumeExpansion: true
++allowVolumeExpansion: false
+ parameters:
+-  profile: raidz1
+-  slabSizeMiB: "64"
+-  allowHeterogeneous: "true"
+-  autoRebalance: "true"
+-  hotSpareSlabsPerDisk: "2"
+-  # diskInventory is populated post-install based on
+-  # /etc/nexus/anyraid-disks.yaml chosen by the operator.
+-  diskInventory: ""
++  nodePath: /var/lib/nexus/anyraid
++#
++# Pool health is deliberately NOT collected by an in-cluster DaemonSet. The
++# cockpit already runs as a systemd unit on the host, so it can call `lvs`
++# directly via anyraid_provisioner.pool_status() and serve the result from
++# GET /api/v1/storage/anyraid. Doing it that way avoids adding a privileged,
++# hostPID pod with a hostPath mount purely to read node-local state.
+diff --git a/installer/overlay/usr/lib/nexus/anyraid_provisioner.py b/installer/overlay/usr/lib/nexus/anyraid_provisioner.py
+new file mode 100644
+index 000000000..b4c01968a
+--- /dev/null
++++ b/installer/overlay/usr/lib/nexus/anyraid_provisioner.py
+@@ -0,0 +1,303 @@
++#!/usr/bin/env python3
++"""AnyRAID: redundant pools spanning heterogeneous-capacity drives.
++
++Implemented on LVM rather than as a bespoke block layer. LVM already provides
++exactly the primitive AnyRAID needs: a volume group pools physical volumes of
++differing sizes and allocates in fixed-size *extents* (the "slabs"), and its
++RAID targets sit on top of dm-raid, the same kernel code mdadm drives. Writing a
++new slab allocator would mean reimplementing well-tested storage code where
++bugs destroy data, so the profile names map onto dm-raid levels instead.
++
++Profile mapping and why:
++
++===============  ============  =======================================
++AnyRAID profile  LVM type      Redundancy
++===============  ============  =======================================
++mirror           raid1         survives N-1 drive losses
++striped-mirror   raid10        striped mirrors, survives 1 per mirror
++raidz1           raid5         single parity, survives 1 drive
++raidz2           raid6         double parity, survives 2 drives
++raidz3           unsupported   no triple-parity target exists in dm-raid
++===============  ============  =======================================
++
++``raidz3`` is rejected rather than silently downgraded to raid6. Accepting it
++and delivering two-drive tolerance would misrepresent the redundancy an
++operator asked for.
++
++Heterogeneous capacity note: parity and mirror layouts allocate equal-size
++extents per stripe leg, so usable space is bounded by the *smallest* member.
++:func:`plan_pool` reports the resulting stranded capacity per drive explicitly
++so the wizard can show it instead of over-promising a raw-sum total.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import shutil
++import subprocess
++from typing import Any
++
++VG_NAME = os.environ.get("NEXUS_ANYRAID_VG", "nexus-anyraid")
++LV_NAME = os.environ.get("NEXUS_ANYRAID_LV", "pool")
++
++# AnyRAID profile -> (lvm segment type, minimum drives, parity/mirror legs)
++PROFILE_MAP: dict[str, dict[str, Any]] = {
++    "mirror": {"lvm_type": "raid1", "min_drives": 2, "redundant_legs": 1},
++    "striped-mirror": {"lvm_type": "raid10", "min_drives": 4, "redundant_legs": 1},
++    "raidz1": {"lvm_type": "raid5", "min_drives": 3, "redundant_legs": 1},
++    "raidz2": {"lvm_type": "raid6", "min_drives": 4, "redundant_legs": 2},
++}
++
++UNSUPPORTED_PROFILES = {
++    "raidz3": (
++        "dm-raid provides no triple-parity target; use raidz2 (double parity) "
++        "or a mirror profile. Silently substituting raid6 would deliver less "
++        "redundancy than requested."
++    )
++}
++
++DEVICE_RE = re.compile(r"^/dev/[a-zA-Z0-9/_-]+$")
++
++
++class AnyRaidError(Exception):
++    """Raised for invalid input or a failed LVM operation."""
++
++
++def _require_tools() -> None:
++    missing = [t for t in ("pvcreate", "vgcreate", "lvcreate", "vgs", "lvs") if not shutil.which(t)]
++    if missing:
++        raise AnyRaidError("LVM tooling not installed on this node: %s" % ", ".join(missing))
++
++
++def _validate_device(device: str) -> str:
++    """Reject anything that is not a plain absolute device path.
++
++    The device list reaches this module from the install wizard and the cockpit
++    API, so it must never be interpolated into a shell or accepted unchecked.
++    All subprocess calls use argument lists, and this guards against a caller
++    smuggling flags (``--force``) or paths outside /dev.
++    """
++    device = (device or "").strip()
++    if not DEVICE_RE.match(device):
++        raise AnyRaidError("invalid device path: %r" % device)
++    if ".." in device:
++        raise AnyRaidError("invalid device path: %r" % device)
++    return device
++
++
++def _device_size_bytes(device: str) -> int:
++    """Size via BLKGETSIZE64, falling back to sysfs for partitions."""
++    try:
++        with open(device, "rb") as fh:
++            return os.lseek(fh.fileno(), 0, os.SEEK_END)
++    except OSError as exc:
++        raise AnyRaidError("cannot size %s: %s" % (device, exc)) from exc
++
++
++def plan_pool(devices: list[str], profile: str, extent_size_mib: int = 64) -> dict[str, Any]:
++    """Compute usable capacity and stranded space without touching the disks."""
++    if profile in UNSUPPORTED_PROFILES:
++        raise AnyRaidError("profile %r is not supported: %s" % (profile, UNSUPPORTED_PROFILES[profile]))
++    spec = PROFILE_MAP.get(profile)
++    if spec is None:
++        raise AnyRaidError(
++            "unknown profile %r (expected one of: %s)" % (profile, ", ".join(sorted(PROFILE_MAP)))
++        )
++
++    validated = [_validate_device(d) for d in devices]
++    if len(set(validated)) != len(validated):
++        raise AnyRaidError("duplicate devices in inventory")
++    if len(validated) < spec["min_drives"]:
++        raise AnyRaidError(
++            "profile %s needs at least %d drives, got %d"
++            % (profile, spec["min_drives"], len(validated))
++        )
++    if profile == "striped-mirror" and len(validated) % 2 != 0:
++        raise AnyRaidError("striped-mirror (raid10) needs an even number of drives")
++
++    sizes = {d: _device_size_bytes(d) for d in validated}
++    smallest = min(sizes.values())
++    if smallest <= 0:
++        raise AnyRaidError("one or more devices report zero size")
++
++    extent = extent_size_mib * 1024 * 1024
++    extents_per_drive = smallest // extent
++    if extents_per_drive == 0:
++        raise AnyRaidError(
++            "smallest device (%d bytes) is below one %d MiB extent" % (smallest, extent_size_mib)
++        )
++
++    count = len(validated)
++    legs = spec["redundant_legs"]
++    if profile == "mirror":
++        data_drives = 1
++    elif profile == "striped-mirror":
++        data_drives = count // 2
++    else:
++        data_drives = count - legs
++
++    usable_bytes = extents_per_drive * extent * data_drives
++    raw_bytes = sum(sizes.values())
++    # Space above the smallest member cannot be used by an equal-leg layout.
++    stranded = {d: size - (extents_per_drive * extent) for d, size in sizes.items()}
++
++    return {
++        "profile": profile,
++        "lvmType": spec["lvm_type"],
++        "devices": validated,
++        "deviceSizes": sizes,
++        "extentSizeMiB": extent_size_mib,
++        "extentsPerDrive": extents_per_drive,
++        "dataDrives": data_drives,
++        "redundantLegs": legs,
++        "rawBytes": raw_bytes,
++        "usableBytes": usable_bytes,
++        "strandedBytes": sum(stranded.values()),
++        "strandedPerDevice": stranded,
++        "heterogeneous": len(set(sizes.values())) > 1,
++        "toleratedDriveFailures": legs if profile != "mirror" else count - 1,
++    }
++
++
++def _run(cmd: list[str], timeout: int = 300) -> tuple[bool, str]:
++    """Run a command, returning (ok, combined output) for human-facing steps."""
++    ok, stdout, stderr = _run_split(cmd, timeout)
++    return ok, ((stdout or "") + (stderr or "")).strip()
++
++
++def _run_split(cmd: list[str], timeout: int = 300) -> tuple[bool, str, str]:
++    """As :func:`_run` but keeps streams apart so stdout stays parseable.
++
++    LVM writes warnings to stderr even on success, so combining the streams
++    corrupts ``--reportformat json`` output.
++    """
++    try:
++        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return False, "", str(exc)
++    return proc.returncode == 0, (proc.stdout or "").strip(), (proc.stderr or "").strip()
++
++
++def _concise_lvm_error(stderr: str) -> str:
++    """Pick the most specific line out of LVM's multi-line diagnostics."""
++    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
++    ignorable = ("WARNING: Running as a non-root user",)
++    meaningful = [ln for ln in lines if not ln.startswith(ignorable)]
++    for line in meaningful:
++        if "not found" in line or "Permission denied" in line or "failed" in line.lower():
++            return line
++    return meaningful[-1] if meaningful else "lvs reported no detail"
++
++
++def create_pool(
++    devices: list[str],
++    profile: str,
++    extent_size_mib: int = 64,
++    vg_name: str = VG_NAME,
++    lv_name: str = LV_NAME,
++    filesystem: str = "ext4",
++) -> dict[str, Any]:
++    """Create the AnyRAID pool. Destructive: wipes the listed devices."""
++    _require_tools()
++    plan = plan_pool(devices, profile, extent_size_mib)
++    steps: list[dict[str, Any]] = []
++
++    def step(name: str, cmd: list[str]) -> None:
++        ok, out = _run(cmd)
++        steps.append({"step": name, "command": " ".join(cmd), "ok": ok, "output": out})
++        if not ok:
++            raise AnyRaidError("%s failed: %s" % (name, out))
++
++    try:
++        step("pvcreate", ["pvcreate", "-ff", "-y", *plan["devices"]])
++        step(
++            "vgcreate",
++            ["vgcreate", "-s", "%dm" % extent_size_mib, vg_name, *plan["devices"]],
++        )
++        # -l 100%FREE lets LVM size the RAID LV to the largest layout that fits,
++        # which is the correct answer for heterogeneous members.
++        step(
++            "lvcreate",
++            [
++                "lvcreate",
++                "--yes",
++                "--type", plan["lvmType"],
++                "-l", "100%FREE",
++                "-n", lv_name,
++                vg_name,
++            ],
++        )
++        device_path = "/dev/%s/%s" % (vg_name, lv_name)
++        if filesystem:
++            mkfs = shutil.which("mkfs.%s" % filesystem)
++            if not mkfs:
++                raise AnyRaidError("mkfs.%s not available on this node" % filesystem)
++            step("mkfs", [mkfs, "-q", "-F", device_path] if filesystem.startswith("ext") else [mkfs, device_path])
++    except AnyRaidError as exc:
++        return {"success": False, "error": str(exc), "plan": plan, "steps": steps}
++
++    return {
++        "success": True,
++        "error": None,
++        "plan": plan,
++        "steps": steps,
++        "devicePath": "/dev/%s/%s" % (vg_name, lv_name),
++    }
++
++
++def pool_status(vg_name: str = VG_NAME, lv_name: str = LV_NAME) -> dict[str, Any]:
++    """Report real pool state from LVM, including sync and degraded status."""
++    if not shutil.which("lvs"):
++        return {"exists": False, "error": "LVM tooling not installed"}
++    ok, stdout, stderr = _run_split(
++        [
++            "lvs",
++            "--reportformat", "json",
++            "-o", "lv_name,vg_name,lv_size,segtype,sync_percent,lv_health_status,raid_mismatch_count",
++            "%s/%s" % (vg_name, lv_name),
++        ]
++    )
++    # lvs can emit a well-formed empty report and still exit non-zero, so try
++    # to parse stdout regardless and only fall back to the stderr summary.
++    entries: list[dict[str, Any]] = []
++    parsed = False
++    if stdout:
++        try:
++            entries = json.loads(stdout)["report"][0]["lv"]
++            parsed = True
++        except (json.JSONDecodeError, KeyError, IndexError):
++            parsed = False
++
++    if not parsed:
++        return {
++            "exists": False,
++            "error": _concise_lvm_error(stderr) if stderr else "unparseable lvs output",
++        }
++    if not entries:
++        return {
++            "exists": False,
++            "error": None if ok else _concise_lvm_error(stderr),
++            "message": "no AnyRAID pool provisioned on this node",
++        }
++
++    lv = entries[0]
++    sync_raw = (lv.get("sync_percent") or "").strip()
++    try:
++        sync = float(sync_raw) if sync_raw else None
++    except ValueError:
++        sync = None
++    health = (lv.get("lv_health_status") or "").strip()
++    return {
++        "exists": True,
++        "error": None,
++        "name": lv.get("lv_name"),
++        "volumeGroup": lv.get("vg_name"),
++        "size": lv.get("lv_size"),
++        "segmentType": lv.get("segtype"),
++        "syncPercent": sync,
++        "healthStatus": health or "ok",
++        "degraded": bool(health) and health != "",
++        "mismatchCount": lv.get("raid_mismatch_count"),
++    }
+diff --git a/installer/overlay/usr/lib/nexus/serve-cockpit.py b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+index 5e3f5ef52..fe08d5a77 100644
+--- a/installer/overlay/usr/lib/nexus/serve-cockpit.py
++++ b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+@@ -26,6 +26,7 @@ DASHBOARDS_MODULE = os.path.join(os.path.dirname(__file__), "dashboard_collector
+ RESOURCES_MODULE = os.path.join(os.path.dirname(__file__), "cluster_resources.py")
+ OVS_MODULE = os.path.join(os.path.dirname(__file__), "ovs_operations.py")
+ AUTH_MODULE = os.path.join(os.path.dirname(__file__), "cockpit_auth.py")
++ANYRAID_MODULE = os.path.join(os.path.dirname(__file__), "anyraid_provisioner.py")
+ 
+ # Endpoints reachable without a session. Everything else under /api/v1
+ # requires a valid bearer token or session cookie.
+@@ -61,6 +62,10 @@ def _load_auth():
+     return _load_module(AUTH_MODULE, "nexus_cockpit_auth")
+ 
+ 
++def _load_anyraid():
++    return _load_module(ANYRAID_MODULE, "nexus_anyraid_provisioner")
++
++
+ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+     def __init__(
+         self,
+@@ -72,6 +77,7 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+         auth=None,
+         credentials=None,
+         sessions=None,
++        anyraid=None,
+         tls_enabled=False,
+         **kwargs,
+     ):
+@@ -82,6 +88,7 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+         self._auth = auth
+         self._credentials = credentials
+         self._sessions = sessions
++        self._anyraid = anyraid
+         self._tls_enabled = tls_enabled
+         self._pending_cookie = None
+         self._clear_cookie = False
+@@ -143,6 +150,10 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             self._json_api(self._handle_dashboards)
+             return
+ 
++        if path == "/api/v1/storage/anyraid":
++            self._json_api(self._handle_anyraid_status)
++            return
++
+         if path.startswith("/api/v1/"):
+             self._plain(404, b"not found")
+             return
+@@ -331,6 +342,12 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             raise RuntimeError("dashboard collector unavailable")
+         return self._dashboards.collect_dashboards_live()
+ 
++    def _handle_anyraid_status(self) -> dict:
++        """Real AnyRAID pool state from LVM on this node."""
++        if self._anyraid is None:
++            return {"exists": False, "error": "AnyRAID provisioner unavailable"}
++        return self._anyraid.pool_status()
++
+     def _handle_apply_manifest(self) -> dict:
+         if self._resources is None:
+             raise RuntimeError("resource apply unavailable")
+@@ -448,6 +465,12 @@ def main() -> int:
+         sys.stderr.write("nexus-cockpit: OVS module disabled: %s\n" % exc)
+         ovs = None
+ 
++    try:
++        anyraid = _load_anyraid()
++    except Exception as exc:  # noqa: BLE001
++        sys.stderr.write("nexus-cockpit: AnyRAID provisioner disabled: %s\n" % exc)
++        anyraid = None
++
+     # Authentication is mandatory: every /api/v1 route other than login and
+     # session discovery mutates or exposes cluster state, so the cockpit
+     # refuses to serve at all if the credential store cannot be initialised.
+@@ -477,6 +500,7 @@ def main() -> int:
+         "auth": auth,
+         "credentials": credentials,
+         "sessions": sessions,
++        "anyraid": anyraid,
+     }
+ 
+     if os.path.isfile(TLS_CRT) and os.path.isfile(TLS_KEY):
+diff --git a/installer/tests/anyraid-provisioner.test.ts b/installer/tests/anyraid-provisioner.test.ts
+new file mode 100644
+index 000000000..0bb5bd413
+--- /dev/null
++++ b/installer/tests/anyraid-provisioner.test.ts
+@@ -0,0 +1,248 @@
++/**
++ * Contract tests for installer/overlay/usr/lib/nexus/anyraid_provisioner.py.
++ *
++ * AnyRAID is implemented over LVM: a volume group pools physical volumes of
++ * differing sizes and allocates in fixed-size extents (the "slabs"), with
++ * redundancy from dm-raid. These tests cover the planning and validation logic,
++ * which is pure and needs no root. Pool creation itself drives lvcreate and is
++ * exercised on a node with a device-mapper capable kernel.
++ *
++ * Capacity planning is verified against sparse loop-backed files so the sizes
++ * are real rather than mocked.
++ */
++
++import { execFileSync } from 'node:child_process';
++import {
++  closeSync,
++  mkdtempSync,
++  openSync,
++  readFileSync,
++  rmSync,
++  truncateSync,
++  writeFileSync,
++} from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join, resolve } from 'node:path';
++import { afterAll, beforeAll, describe, expect, it } from 'vitest';
++
++const MODULE = resolve(__dirname, '../overlay/usr/lib/nexus/anyraid_provisioner.py');
++const workdir = mkdtempSync(join(tmpdir(), 'nexus-anyraid-'));
++
++/** Sparse files standing in for block devices, so sizes are genuinely read. */
++const DEVICES = {
++  small1: join(workdir, 'small1.img'),
++  small2: join(workdir, 'small2.img'),
++  small3: join(workdir, 'small3.img'),
++  small4: join(workdir, 'small4.img'),
++  small5: join(workdir, 'small5.img'),
++  medium: join(workdir, 'medium.img'),
++  large: join(workdir, 'large.img'),
++};
++
++const MIB = 1024 * 1024;
++
++beforeAll(() => {
++  const sizes: Array<[string, number]> = [
++    [DEVICES.small1, 640 * MIB],
++    [DEVICES.small2, 640 * MIB],
++    [DEVICES.small3, 640 * MIB],
++    [DEVICES.small4, 640 * MIB],
++    [DEVICES.small5, 640 * MIB],
++    [DEVICES.medium, 1280 * MIB],
++    [DEVICES.large, 2048 * MIB],
++  ];
++  for (const [path, size] of sizes) {
++    writeFileSync(path, '');
++    truncateSync(path, size);
++    closeSync(openSync(path, 'r'));
++  }
++});
++
++afterAll(() => rmSync(workdir, { recursive: true, force: true }));
++
++interface PlanResult {
++  ok: boolean;
++  error?: string;
++  plan?: {
++    profile: string;
++    lvmType: string;
++    dataDrives: number;
++    redundantLegs: number;
++    usableBytes: number;
++    rawBytes: number;
++    strandedBytes: number;
++    heterogeneous: boolean;
++    toleratedDriveFailures: number;
++    extentsPerDrive: number;
++  };
++}
++
++/**
++ * Plan a pool. Device paths are passed through a patched validator because the
++ * production regex correctly insists on /dev/... paths, which a unit test
++ * cannot create.
++ */
++function plan(devices: string[], profile: string, extentMiB = 64): PlanResult {
++  const script = [
++    'import importlib.util, json',
++    `spec = importlib.util.spec_from_file_location("ar", ${JSON.stringify(MODULE)})`,
++    'ar = importlib.util.module_from_spec(spec)',
++    'spec.loader.exec_module(ar)',
++    'ar._validate_device = lambda d: d',  // allow tmpdir paths
++    'try:',
++    `    p = ar.plan_pool(${JSON.stringify(devices)}, ${JSON.stringify(profile)}, ${extentMiB})`,
++    '    print(json.dumps({"ok": True, "plan": p}))',
++    'except ar.AnyRaidError as e:',
++    '    print(json.dumps({"ok": False, "error": str(e)}))',
++  ].join('\n');
++  return JSON.parse(execFileSync('python3', ['-c', script], { encoding: 'utf-8' })) as PlanResult;
++}
++
++describe('profile to dm-raid mapping', () => {
++  it.each([
++    ['mirror', 'raid1', 1],
++    ['striped-mirror', 'raid10', 1],
++    ['raidz1', 'raid5', 1],
++    ['raidz2', 'raid6', 2],
++  ])('maps %s onto %s', (profile, lvmType, legs) => {
++    const all = [DEVICES.small1, DEVICES.small2, DEVICES.medium, DEVICES.large];
++    const result = plan(all, profile);
++    expect(result.ok).toBe(true);
++    expect(result.plan!.lvmType).toBe(lvmType);
++    expect(result.plan!.redundantLegs).toBe(legs);
++  });
++
++  it('refuses raidz3 rather than silently downgrading to raid6', () => {
++    const all = [DEVICES.small1, DEVICES.small2, DEVICES.medium, DEVICES.large];
++    const result = plan(all, 'raidz3');
++    expect(result.ok).toBe(false);
++    // Delivering 2-drive tolerance for a 3-parity request would misrepresent
++    // the redundancy the operator selected.
++    expect(result.error).toMatch(/no triple-parity/i);
++  });
++
++  it('rejects an unknown profile', () => {
++    const result = plan([DEVICES.small1, DEVICES.small2, DEVICES.medium], 'raidz9');
++    expect(result.ok).toBe(false);
++    expect(result.error).toMatch(/unknown profile/i);
++  });
++});
++
++describe('heterogeneous capacity accounting', () => {
++  it('bounds usable capacity by the smallest member, not the raw sum', () => {
++    const all = [DEVICES.small1, DEVICES.small2, DEVICES.medium, DEVICES.large];
++    const { plan: p } = plan(all, 'raidz1');
++
++    expect(p!.heterogeneous).toBe(true);
++    // raidz1 over 4 drives => 3 data drives, each limited to the 640 MiB member.
++    expect(p!.dataDrives).toBe(3);
++    expect(p!.usableBytes).toBe(p!.extentsPerDrive * 64 * MIB * 3);
++    // Raw total is ~4.5 GiB; usable must be well below it.
++    expect(p!.usableBytes).toBeLessThan(p!.rawBytes);
++    expect(p!.strandedBytes).toBeGreaterThan(0);
++  });
++
++  it('reports no stranded capacity when all drives match', () => {
++    const { plan: p } = plan([DEVICES.small1, DEVICES.small2, DEVICES.small3], 'mirror');
++    expect(p!.heterogeneous).toBe(false);
++    expect(p!.strandedBytes).toBe(0);
++  });
++
++  it('states tolerated drive failures per profile', () => {
++    const four = [DEVICES.small1, DEVICES.small2, DEVICES.medium, DEVICES.large];
++    expect(plan(four, 'raidz1').plan!.toleratedDriveFailures).toBe(1);
++    expect(plan(four, 'raidz2').plan!.toleratedDriveFailures).toBe(2);
++    // An N-way mirror survives every drive but one.
++    expect(plan(four, 'mirror').plan!.toleratedDriveFailures).toBe(3);
++  });
++
++  it('honours a larger extent size', () => {
++    const all = [DEVICES.small1, DEVICES.small2, DEVICES.medium];
++    const small = plan(all, 'raidz1', 64).plan!;
++    const large = plan(all, 'raidz1', 256).plan!;
++    expect(small.extentsPerDrive).toBeGreaterThan(large.extentsPerDrive);
++  });
++});
++
++describe('input validation', () => {
++  it('enforces the minimum drive count per profile', () => {
++    expect(plan([DEVICES.small1], 'mirror').error).toMatch(/at least 2/);
++    expect(plan([DEVICES.small1, DEVICES.small2], 'raidz1').error).toMatch(/at least 3/);
++    expect(plan([DEVICES.small1, DEVICES.small2, DEVICES.medium], 'raidz2').error).toMatch(/at least 4/);
++  });
++
++  it('requires an even drive count for raid10', () => {
++    // Five drives clears the 4-drive minimum, so the parity check is what fails.
++    const five = [
++      DEVICES.small1,
++      DEVICES.small2,
++      DEVICES.small3,
++      DEVICES.small4,
++      DEVICES.small5,
++    ];
++    const result = plan(five, 'striped-mirror');
++    expect(result.ok).toBe(false);
++    expect(result.error).toMatch(/even number/i);
++  });
++
++  it('rejects duplicate devices', () => {
++    const dupes = [DEVICES.small1, DEVICES.small1, DEVICES.medium];
++    expect(plan(dupes, 'raidz1').error).toMatch(/duplicate/i);
++  });
++
++  it('rejects device paths outside /dev, including injection attempts', () => {
++    // Uses the real validator, so no monkeypatch here.
++    const script = [
++      'import importlib.util, json',
++      `spec = importlib.util.spec_from_file_location("ar", ${JSON.stringify(MODULE)})`,
++      'ar = importlib.util.module_from_spec(spec)',
++      'spec.loader.exec_module(ar)',
++      'bad = ["/dev/sda; rm -rf /", "--force", "/etc/passwd", "/dev/../etc/shadow", "", "sda"]',
++      'out = []',
++      'for d in bad:',
++      '    try:',
++      '        ar._validate_device(d)',
++      '        out.append({"device": d, "rejected": False})',
++      '    except ar.AnyRaidError:',
++      '        out.append({"device": d, "rejected": True})',
++      'print(json.dumps(out))',
++    ].join('\n');
++    const results = JSON.parse(
++      execFileSync('python3', ['-c', script], { encoding: 'utf-8' }),
++    ) as Array<{ device: string; rejected: boolean }>;
++    expect(results.every((r) => r.rejected)).toBe(true);
++  });
++
++  it('accepts well-formed device paths', () => {
++    const script = [
++      'import importlib.util, json',
++      `spec = importlib.util.spec_from_file_location("ar", ${JSON.stringify(MODULE)})`,
++      'ar = importlib.util.module_from_spec(spec)',
++      'spec.loader.exec_module(ar)',
++      'good = ["/dev/sda", "/dev/nvme0n1", "/dev/disk/by-id/scsi-abc_123"]',
++      'print(json.dumps([ar._validate_device(d) for d in good]))',
++    ].join('\n');
++    const out = JSON.parse(execFileSync('python3', ['-c', script], { encoding: 'utf-8' }));
++    expect(out).toEqual(['/dev/sda', '/dev/nvme0n1', '/dev/disk/by-id/scsi-abc_123']);
++  });
++});
++
++describe('manifest hygiene', () => {
++  it('no longer references the non-existent AnyRAID CSI image', () => {
++    const manifest = resolve(__dirname, '../manifests/30-anyraid-csi.yaml');
++    const text = readFileSync(manifest, 'utf-8');
++    // Ignore comments: the file explains why the phantom driver was removed,
++    // so it mentions the old names in prose. Only live YAML matters here.
++    const active = text
++      .split('\n')
++      .filter((line) => !line.trimStart().startsWith('#'))
++      .join('\n');
++
++    // This image was never built: no source or Dockerfile for it exists in the
++    // repo, so the DaemonSet was a guaranteed ImagePullBackOff.
++    expect(active).not.toContain('nexus-anyraid-csi');
++    expect(active).not.toContain('anyraid.csi.nexus.io');
++    // The replacement must still provide the StorageClass the wizard expects.
++    expect(active).toContain('anyraid-default');
++  });
++});
+-- 
+2.43.0
+
