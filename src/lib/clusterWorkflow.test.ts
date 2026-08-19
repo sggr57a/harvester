@@ -33,6 +33,75 @@ describe('cluster workflow helpers', () => {
     expect(preview.resources.map((resource) => resource.kind)).toEqual(['Deployment', 'PersistentVolumeClaim']);
   });
 
+  it('allows trigger CRDs without demo allow-list warnings', () => {
+    const triggerManifest = `apiVersion: eventing.knative.dev/v1
+kind: Trigger
+metadata:
+  name: demo-trigger
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerTemplate
+metadata:
+  name: demo-trigger-template
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: TriggerBinding
+metadata:
+  name: demo-trigger-binding
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: ClusterTriggerBinding
+metadata:
+  name: demo-cluster-trigger-binding
+---
+apiVersion: triggers.tekton.dev/v1beta1
+kind: EventListener
+metadata:
+  name: demo-event-listener
+---
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: demo-event-source
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Sensor
+metadata:
+  name: demo-sensor
+`;
+
+    const validation = validateKubernetesManifest(triggerManifest);
+
+    expect(validation.valid).toBe(true);
+    expect(validation.resources.map((resource) => resource.kind)).toEqual([
+      'Trigger',
+      'TriggerTemplate',
+      'TriggerBinding',
+      'ClusterTriggerBinding',
+      'EventListener',
+      'EventSource',
+      'Sensor',
+    ]);
+    expect(validation.issues).toEqual([]);
+  });
+
+  it('keeps warning for unknown non-trigger resources with trigger in the name', () => {
+    const validation = validateKubernetesManifest(`apiVersion: example.com/v1
+kind: ReTriggerableWidget
+metadata:
+  name: unknown-widget
+`);
+
+    expect(validation.valid).toBe(true);
+    expect(validation.issues).toEqual([
+      {
+        severity: 'warning',
+        message: 'Kind ReTriggerableWidget is not in the Nexus demo allow-list',
+        resource: 'ReTriggerableWidget/unknown-widget',
+      },
+    ]);
+  });
+
   it('builds a kubectl dry-run/apply test run with commands and successful checks', () => {
     const run = buildApplyTestRun(manifest, defaultConfig);
 

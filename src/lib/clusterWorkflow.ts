@@ -87,6 +87,24 @@ const SUPPORTED_KINDS = new Set([
   'StorageClass',
 ]);
 
+// Trigger-flavored CRDs from the eventing/CI ecosystems the Nexus demo
+// showcases (Knative eventing, Tekton triggers, Argo Events). Kept as a
+// separate set so the "Allow all triggers" allow-list can be audited
+// independently from the core kinds above.
+const TRIGGER_KINDS = new Set([
+  'ClusterTriggerBinding',
+  'EventListener',
+  'EventSource',
+  'Sensor',
+  'Trigger',
+  'TriggerBinding',
+  'TriggerTemplate',
+]);
+
+function isSupportedKind(kind: string): boolean {
+  return SUPPORTED_KINDS.has(kind) || TRIGGER_KINDS.has(kind);
+}
+
 function parseResources(manifest: string): { resources: ManifestResource[]; issues: ValidationIssue[] } {
   const issues: ValidationIssue[] = [];
   const resources: ManifestResource[] = [];
@@ -121,7 +139,7 @@ function parseResources(manifest: string): { resources: ManifestResource[]; issu
     if (!name) {
       issues.push({ severity: 'error', message: 'Missing metadata.name', resource: resourceLabel });
     }
-    if (kind && !SUPPORTED_KINDS.has(kind)) {
+    if (kind && !isSupportedKind(kind)) {
       issues.push({ severity: 'warning', message: `Kind ${kind} is not in the Nexus demo allow-list`, resource: resourceLabel });
     }
 
