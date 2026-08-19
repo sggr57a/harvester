@@ -1,0 +1,1579 @@
+From 4047acd16effbe36d4ae9c111a4036ad4a1c3a3c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 16:25:01 +0000
+Subject: [PATCH] feat(telemetry): measure storage IOPS from diskstats and show
+ on dashboards
+
+Host metrics difference /proc/diskstats per physical disk (read/write IOPS
+and MiB/s), skip NVMe partitions, and fall back to a writable sample file
+so rates are not stuck unavailable. The same tick as CPU/RAM carries
+storageIops onto the Storage dashboard, environment ticker, and hardware
+HUDs. Live CSI backend cards keep IOPS as unavailable instead of a fake 0.
+---
+ .../overlay/usr/lib/nexus/cluster_metrics.py  |  19 ++
+ .../usr/lib/nexus/dashboard_collectors.py     |  20 ++-
+ .../overlay/usr/lib/nexus/host_metrics.py     | 130 ++++++++++----
+ installer/tests/dashboard-collectors.test.ts  |  82 +++++++++
+ .../tests/hardware-dashboard-wiring.test.ts   |  42 +++++
+ installer/tests/host-metrics.test.ts          | 166 ++++++++++++++++++
+ installer/tests/installer.test.ts             |   2 +
+ src/components/EnvironmentTicker.tsx          |  21 ++-
+ src/components/dashboards/Dashboards.tsx      |  33 +++-
+ .../dashboards/EnvironmentIntelHudView.tsx    |   8 +-
+ src/components/dashboards/MissionControl.tsx  |  15 +-
+ .../dashboards/ResourceMonitorHudView.tsx     |   8 +-
+ .../dashboards/StorageIopsMetrics.tsx         |  72 ++++++++
+ src/components/dashboards/TelemetryWave.tsx   |   8 +-
+ src/lib/liveTelemetry.test.ts                 |  10 ++
+ src/lib/liveTelemetry.ts                      |   5 +
+ src/lib/telemetry/emptySnapshot.ts            |  19 ++
+ src/lib/telemetry/environmentAdapter.ts       |   1 +
+ src/lib/telemetry/storageIops.test.ts         | 133 ++++++++++++++
+ src/lib/telemetry/storageIops.ts              | 118 +++++++++++++
+ src/lib/telemetry/types.ts                    |   3 +
+ src/styles.css                                |  14 ++
+ 22 files changed, 868 insertions(+), 61 deletions(-)
+ create mode 100644 installer/tests/host-metrics.test.ts
+ create mode 100644 src/components/dashboards/StorageIopsMetrics.tsx
+ create mode 100644 src/lib/telemetry/storageIops.test.ts
+ create mode 100644 src/lib/telemetry/storageIops.ts
+
+diff --git a/installer/overlay/usr/lib/nexus/cluster_metrics.py b/installer/overlay/usr/lib/nexus/cluster_metrics.py
+index 849a4394..405e876c 100644
+--- a/installer/overlay/usr/lib/nexus/cluster_metrics.py
++++ b/installer/overlay/usr/lib/nexus/cluster_metrics.py
+@@ -275,6 +275,11 @@ def _collect_host_metrics() -> dict[str, Any]:
+         return {
+             "watts": None,
+             "totalIops": None,
++            "readIops": None,
++            "writeIops": None,
++            "readMiBs": None,
++            "writeMiBs": None,
++            "disks": [],
+             "ingressMbps": None,
+             "egressMbps": None,
+             "sources": {"host": "unavailable (host_metrics failed to load)"},
+@@ -344,6 +349,19 @@ def _save_state(state: dict[str, Any]) -> None:
+         sys.stderr.write("nexus-metrics: state persist failed (%s); continuing\n" % exc)
+ 
+ 
++def _storage_iops_from_host(host: dict[str, Any]) -> dict[str, Any]:
++    sources = host.get("sources") or {}
++    return {
++        "totalIops": host.get("totalIops"),
++        "readIops": host.get("readIops"),
++        "writeIops": host.get("writeIops"),
++        "readMiBs": host.get("readMiBs"),
++        "writeMiBs": host.get("writeMiBs"),
++        "devices": host.get("disks") or [],
++        "source": sources.get("totalIops"),
++    }
++
++
+ def collect_environment() -> dict[str, Any]:
+     kubeconfig = _find_kubeconfig()
+     if not kubeconfig:
+@@ -390,6 +408,7 @@ def collect_environment() -> dict[str, Any]:
+         # Same poll as CPU / RAM so every hardware dashboard can render
+         # FPGA / GPU / NPU / TPU without a second round trip.
+         "accelerators": accelerators,
++        "storageIops": _storage_iops_from_host(host),
+         # Per-metric provenance so the cockpit can label partial coverage
+         # rather than presenting every figure as equally authoritative.
+         "metricSources": {
+diff --git a/installer/overlay/usr/lib/nexus/dashboard_collectors.py b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+index 34dff378..6cd65642 100644
+--- a/installer/overlay/usr/lib/nexus/dashboard_collectors.py
++++ b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+@@ -11,6 +11,7 @@ from typing import Any
+ from cluster_filters import is_user_namespace
+ from cluster_metrics import (
+     _collect_accelerator_summary,
++    _collect_host_metrics,
+     _count_active_migrations,
+     _find_kubeconfig,
+     _kubectl_json,
+@@ -21,6 +22,7 @@ from cluster_metrics import (
+     _parse_bytes,
+     _parse_cpu_cores,
+     _save_state,
++    _storage_iops_from_host,
+ )
+ 
+ try:
+@@ -544,6 +546,7 @@ def collect_dashboards_live() -> dict[str, Any]:
+         if source in by_sensor and isinstance(by_sensor[source], dict):
+             by_sensor[source]["ingesting"] = True
+     networking = collect_networking_slice(kubeconfig) if collect_networking_slice else {"available": False}
++    host = _collect_host_metrics()
+ 
+     work_items = []
+     for mig in migrations[:6]:
+@@ -570,18 +573,21 @@ def collect_dashboards_live() -> dict[str, Any]:
+                 }
+             )
+ 
++    host_iops = host.get("totalIops")
++    env_iops = host_iops if host_iops is not None else (int(total_iops) if monitoring and total_iops else None)
++
+     return {
+         "environment": {
+             "totalWorkloads": pod_count + vm_count,
+-            "totalIops": int(total_iops),
+-            "ingressMbps": int(ingress_mbps),
+-            "egressMbps": int(egress_mbps),
++            "totalIops": env_iops,
++            "ingressMbps": host.get("ingressMbps") if host.get("ingressMbps") is not None else (int(ingress_mbps) if monitoring and ingress_mbps else None),
++            "egressMbps": host.get("egressMbps") if host.get("egressMbps") is not None else (int(egress_mbps) if monitoring and egress_mbps else None),
+             "cpuPercent": cpu_percent,
+             "ramPercent": ram_percent,
+-            "watts": node_count * 220,
++            "watts": host.get("watts"),
+             "activeMigrations": migrations_count,
+-            "openCves": int(state.get("openCves", 0)),
+-            "trustScore": int(state.get("trustScore", 85)),
++            "openCves": int(state.get("openCves", 0)) if state.get("openCves") is not None else None,
++            "trustScore": int(state.get("trustScore", 0)) if state.get("trustScore") is not None else None,
+             "tick": tick,
+             "source": "mixed" if monitoring else "harvester",
+             "clusterReady": True,
+@@ -590,6 +596,8 @@ def collect_dashboards_live() -> dict[str, Any]:
+             "podCount": pod_count,
+             "vmCount": vm_count,
+             "accelerators": _collect_accelerator_summary(),
++            "storageIops": _storage_iops_from_host(host),
++            "metricSources": host.get("sources") or {},
+         },
+         "storage": {
+             "pvcs": pvcs,
+diff --git a/installer/overlay/usr/lib/nexus/host_metrics.py b/installer/overlay/usr/lib/nexus/host_metrics.py
+index 4df2d15e..8dd00081 100644
+--- a/installer/overlay/usr/lib/nexus/host_metrics.py
++++ b/installer/overlay/usr/lib/nexus/host_metrics.py
+@@ -24,12 +24,16 @@ from __future__ import annotations
+ 
+ import json
+ import os
++import re
+ import shutil
+ import subprocess
+ import time
+ from typing import Any
+ 
+ SAMPLE_FILE = os.environ.get("NEXUS_HOST_SAMPLE_FILE", "/var/lib/nexus/host-sample.json")
++SAMPLE_FILE_FALLBACK = "/tmp/nexus-host-sample.json"
++PARTITION_RE = re.compile(r"p\d+$")
++SECTOR_BYTES = 512.0
+ 
+ # Virtual and loopback devices would double-count traffic that already
+ # traverses a physical NIC, so they are excluded from throughput totals.
+@@ -113,26 +117,31 @@ def _ipmi_watts() -> float | None:
+ # ---------------------------------------------------------------- disk
+ 
+ 
+-def _diskstats() -> dict[str, tuple[int, int]] | None:
+-    """Return {device: (reads_completed, writes_completed)} for real devices."""
++def _is_partition(name: str) -> bool:
++    """True for sda1 / nvme0n1p1 / mmcblk0p2 — not the parent device."""
++    if name.startswith(("nvme", "mmcblk")):
++        return bool(PARTITION_RE.search(name))
++    return bool(name) and name[-1].isdigit()
++
++
++def _diskstats(proc_root: str = "/proc") -> dict[str, tuple[int, int, int, int]] | None:
++    """Return {device: (reads, writes, sectors_read, sectors_written)}."""
++    path = os.path.join(proc_root, "diskstats")
+     try:
+-        with open("/proc/diskstats", "r", encoding="utf-8") as fh:
++        with open(path, "r", encoding="utf-8") as fh:
+             lines = fh.readlines()
+     except OSError:
+         return None
+-    out: dict[str, tuple[int, int]] = {}
++    out: dict[str, tuple[int, int, int, int]] = {}
+     for line in lines:
+         fields = line.split()
+-        if len(fields) < 8:
++        if len(fields) < 10:
+             continue
+         name = fields[2]
+-        if name.startswith(VIRTUAL_DISK_PREFIXES):
+-            continue
+-        # Skip partitions (sda1) in favour of their parent device (sda).
+-        if name[-1].isdigit() and not name.startswith("nvme"):
++        if name.startswith(VIRTUAL_DISK_PREFIXES) or _is_partition(name):
+             continue
+         try:
+-            out[name] = (int(fields[3]), int(fields[7]))
++            out[name] = (int(fields[3]), int(fields[7]), int(fields[5]), int(fields[9]))
+         except ValueError:
+             continue
+     return out or None
+@@ -141,10 +150,11 @@ def _diskstats() -> dict[str, tuple[int, int]] | None:
+ # ---------------------------------------------------------------- network
+ 
+ 
+-def _netdev() -> dict[str, tuple[int, int]] | None:
++def _netdev(proc_root: str = "/proc") -> dict[str, tuple[int, int]] | None:
+     """Return {iface: (rx_bytes, tx_bytes)} for physical interfaces."""
++    path = os.path.join(proc_root, "net", "dev")
+     try:
+-        with open("/proc/net/dev", "r", encoding="utf-8") as fh:
++        with open(path, "r", encoding="utf-8") as fh:
+             lines = fh.readlines()[2:]
+     except OSError:
+         return None
+@@ -167,25 +177,45 @@ def _netdev() -> dict[str, tuple[int, int]] | None:
+ # ---------------------------------------------------------------- sampling
+ 
+ 
+-def _load_sample() -> dict[str, Any]:
++def _resolve_sample_file(explicit: str | None = None) -> str:
++    if explicit:
++        return explicit
++    env = os.environ.get("NEXUS_HOST_SAMPLE_FILE")
++    if env:
++        return env
++    directory = os.path.dirname(SAMPLE_FILE)
++    if directory:
++        try:
++            os.makedirs(directory, exist_ok=True)
++            probe = SAMPLE_FILE + ".probe"
++            with open(probe, "w", encoding="utf-8") as handle:
++                handle.write("")
++            os.remove(probe)
++            return SAMPLE_FILE
++        except OSError:
++            return SAMPLE_FILE_FALLBACK
++    return SAMPLE_FILE
++
++
++def _load_sample(path: str) -> dict[str, Any]:
+     try:
+-        with open(SAMPLE_FILE, "r", encoding="utf-8") as fh:
++        with open(path, "r", encoding="utf-8") as fh:
+             data = json.load(fh)
+         return data if isinstance(data, dict) else {}
+     except (OSError, json.JSONDecodeError):
+         return {}
+ 
+ 
+-def _save_sample(sample: dict[str, Any]) -> None:
++def _save_sample(path: str, sample: dict[str, Any]) -> None:
+     """Best-effort persist; a read-only /var must not break metrics."""
+     try:
+-        directory = os.path.dirname(SAMPLE_FILE)
++        directory = os.path.dirname(path)
+         if directory:
+             os.makedirs(directory, exist_ok=True)
+-        tmp = SAMPLE_FILE + ".tmp"
++        tmp = path + ".tmp"
+         with open(tmp, "w", encoding="utf-8") as fh:
+             json.dump(sample, fh)
+-        os.replace(tmp, SAMPLE_FILE)
++        os.replace(tmp, path)
+     except OSError:
+         pass
+ 
+@@ -197,21 +227,23 @@ def _rate(current: int, previous: int, seconds: float) -> float | None:
+     return (current - previous) / seconds
+ 
+ 
+-def collect_host_metrics() -> dict[str, Any]:
++def collect_host_metrics(proc_root: str = "/proc", sample_file: str | None = None) -> dict[str, Any]:
+     """Sample the host once and return real rates plus availability flags.
+ 
+-    Returns keys ``watts``, ``totalIops``, ``ingressMbps``, ``egressMbps``,
+-    each either a number or ``None``, and ``sources`` describing where each
+-    figure came from so the UI can be explicit about partial coverage.
++    Returns keys ``watts``, ``totalIops``, ``readIops``, ``writeIops``,
++    ``readMiBs``, ``writeMiBs``, ``disks``, ``ingressMbps``, ``egressMbps``,
++    each either a number / list or ``None``, and ``sources`` describing where
++    each figure came from so the UI can be explicit about partial coverage.
+     """
+     now = time.time()
+-    previous = _load_sample()
++    path = _resolve_sample_file(sample_file)
++    previous = _load_sample(path)
+     prev_time = float(previous.get("timestamp") or 0.0)
+     elapsed = now - prev_time if prev_time else 0.0
+ 
+     rapl = _rapl_microjoules()
+-    disks = _diskstats()
+-    nets = _netdev()
++    disks = _diskstats(proc_root)
++    nets = _netdev(proc_root)
+ 
+     sample: dict[str, Any] = {"timestamp": now}
+     if rapl is not None:
+@@ -235,23 +267,52 @@ def collect_host_metrics() -> dict[str, Any]:
+     if watts is None:
+         sources["watts"] = "unavailable"
+ 
+-    # --- disk IOPS ---
++    # --- disk IOPS + throughput ---
+     total_iops: float | None = None
++    read_iops: float | None = None
++    write_iops: float | None = None
++    read_mibs: float | None = None
++    write_mibs: float | None = None
++    disk_rows: list[dict[str, Any]] = []
+     if disks and elapsed > 0 and isinstance(previous.get("disks"), dict):
+-        accumulated = 0.0
++        acc_r = acc_w = acc_sr = acc_sw = 0.0
+         matched = False
+-        for device, (reads, writes) in disks.items():
++        for device, counters in disks.items():
++            reads, writes, sec_r, sec_w = counters
+             prev_pair = previous["disks"].get(device)
+-            if not isinstance(prev_pair, list) or len(prev_pair) != 2:
++            if not isinstance(prev_pair, list) or len(prev_pair) < 2:
+                 continue
+             r = _rate(reads, int(prev_pair[0]), elapsed)
+             w = _rate(writes, int(prev_pair[1]), elapsed)
+             if r is None or w is None:
+                 continue
+-            accumulated += r + w
++            sr = sw = None
++            if len(prev_pair) >= 4:
++                sr = _rate(sec_r, int(prev_pair[2]), elapsed)
++                sw = _rate(sec_w, int(prev_pair[3]), elapsed)
+             matched = True
++            acc_r += r
++            acc_w += w
++            row: dict[str, Any] = {
++                "device": device,
++                "iops": round(r + w, 1),
++                "readIops": round(r, 1),
++                "writeIops": round(w, 1),
++                "readMiBs": None if sr is None else round(sr * SECTOR_BYTES / (1024.0 * 1024.0), 2),
++                "writeMiBs": None if sw is None else round(sw * SECTOR_BYTES / (1024.0 * 1024.0), 2),
++            }
++            disk_rows.append(row)
++            if sr is not None:
++                acc_sr += sr
++            if sw is not None:
++                acc_sw += sw
+         if matched:
+-            total_iops = round(accumulated, 1)
++            total_iops = round(acc_r + acc_w, 1)
++            read_iops = round(acc_r, 1)
++            write_iops = round(acc_w, 1)
++            if any(row.get("readMiBs") is not None for row in disk_rows):
++                read_mibs = round(acc_sr * SECTOR_BYTES / (1024.0 * 1024.0), 2)
++                write_mibs = round(acc_sw * SECTOR_BYTES / (1024.0 * 1024.0), 2)
+             sources["totalIops"] = "/proc/diskstats"
+     if total_iops is None:
+         sources["totalIops"] = "unavailable (needs two samples)"
+@@ -281,11 +342,16 @@ def collect_host_metrics() -> dict[str, Any]:
+     if ingress_mbps is None:
+         sources["network"] = "unavailable (needs two samples)"
+ 
+-    _save_sample(sample)
++    _save_sample(path, sample)
+ 
+     return {
+         "watts": watts,
+         "totalIops": total_iops,
++        "readIops": read_iops,
++        "writeIops": write_iops,
++        "readMiBs": read_mibs,
++        "writeMiBs": write_mibs,
++        "disks": disk_rows,
+         "ingressMbps": ingress_mbps,
+         "egressMbps": egress_mbps,
+         "sources": sources,
+diff --git a/installer/tests/dashboard-collectors.test.ts b/installer/tests/dashboard-collectors.test.ts
+index 55baac44..741fd3aa 100644
+--- a/installer/tests/dashboard-collectors.test.ts
++++ b/installer/tests/dashboard-collectors.test.ts
+@@ -23,6 +23,7 @@ function py<T>(snippet: string): T {
+     env: {
+       ...process.env,
+       NEXUS_TELEMETRY_STATE: join(workdir, 'telemetry-state.json'),
++      NEXUS_HOST_SAMPLE_FILE: join(workdir, 'host-sample.json'),
+     },
+   });
+   return JSON.parse(out) as T;
+@@ -80,6 +81,45 @@ describe('accelerator summary on the CPU/RAM environment tick', () => {
+     expect('ramPercent' in payload).toBe(true);
+   });
+ 
++  it('collect_environment attaches storageIops from /proc/diskstats next to CPU/RAM', () => {
++    const payload = py<{
++      skipped?: boolean;
++      storageIops?: {
++        totalIops: number | null;
++        readIops: number | null;
++        writeIops: number | null;
++        devices: unknown[];
++        source?: string;
++      };
++      totalIops: number | null;
++    }>(
++      [
++        'import cluster_metrics as cm, time',
++        'if not cm._find_kubeconfig():',
++        '    print(json.dumps({"skipped": True}))',
++        'else:',
++        '    cm.collect_environment()',
++        '    time.sleep(1.05)',
++        '    env = cm.collect_environment()',
++        '    print(json.dumps({',
++        '        "skipped": False,',
++        '        "storageIops": env.get("storageIops"),',
++        '        "totalIops": env.get("totalIops"),',
++        '    }))',
++      ].join('\n'),
++    );
++    if (payload.skipped) return;
++    expect(payload.storageIops).toBeDefined();
++    expect(Array.isArray(payload.storageIops?.devices)).toBe(true);
++    expect(payload.totalIops).toBe(payload.storageIops?.totalIops ?? null);
++    if ((payload.storageIops?.devices.length ?? 0) > 0) {
++      expect(typeof payload.storageIops?.totalIops).toBe('number');
++      expect(payload.storageIops?.source).toMatch(/diskstats/);
++    } else {
++      expect(payload.storageIops?.totalIops ?? null).toBeNull();
++    }
++  }, 15000);
++
+   it('collect_dashboards_live includes environment.accelerators and acceleration inventory', () => {
+     const payload = py<{
+       skipped?: boolean;
+@@ -116,3 +156,45 @@ describe('accelerator summary on the CPU/RAM environment tick', () => {
+     expect(payload.accelDevices).toBeGreaterThanOrEqual(0);
+   });
+ });
++
++describe('storage IOPS on the CPU/RAM environment tick', () => {
++  it('collect_dashboards_live includes environment.storageIops rather than fabricating CSI rates', () => {
++    const payload = py<{
++      skipped?: boolean;
++      error?: string;
++      totalIops: number | null;
++      storageTotal?: number | null;
++      storageSource?: string;
++      backendIops?: number;
++      devices?: number;
++    }>(
++      [
++        'import cluster_metrics as cm',
++        'if not cm._find_kubeconfig():',
++        '    print(json.dumps({"skipped": True}))',
++        'else:',
++        '    import dashboard_collectors as dc',
++        '    live = dc.collect_dashboards_live()',
++        '    env = live.get("environment") or {}',
++        '    storage = env.get("storageIops") or {}',
++        '    backends = (live.get("storage") or {}).get("backends") or []',
++        '    print(json.dumps({',
++        '        "skipped": False,',
++        '        "totalIops": env.get("totalIops"),',
++        '        "storageTotal": storage.get("totalIops"),',
++        '        "storageSource": storage.get("source"),',
++        '        "backendIops": (backends[0] or {}).get("iops") if backends else None,',
++        '        "devices": len(storage.get("devices") or []),',
++        '    }))',
++      ].join('\n'),
++    );
++    if (payload.skipped) return;
++    expect(payload.error).toBeUndefined();
++    expect(payload.devices).toBeGreaterThanOrEqual(0);
++    expect(payload.totalIops).toBe(payload.storageTotal ?? null);
++    expect(payload.storageSource).toMatch(/diskstats|unavailable/);
++    if (payload.backendIops != null) {
++      expect(payload.backendIops).toBe(0);
++    }
++  });
++});
+diff --git a/installer/tests/hardware-dashboard-wiring.test.ts b/installer/tests/hardware-dashboard-wiring.test.ts
+index 72d757db..235a3ea0 100644
+--- a/installer/tests/hardware-dashboard-wiring.test.ts
++++ b/installer/tests/hardware-dashboard-wiring.test.ts
+@@ -44,3 +44,45 @@ describe('hardware dashboards include add-in card metrics next to CPU/RAM', () =
+     }
+   });
+ });
++
++describe('hardware dashboards include measured storage IOPS next to CPU/RAM', () => {
++  const views: Array<{ file: string; mustInclude: RegExp[] }> = [
++    {
++      file: 'src/components/EnvironmentTicker.tsx',
++      mustInclude: [/storageIopsTickerCells/, /formatMetric\(snapshot, 'totalIops'/, /snapshot\.storageIops/],
++    },
++    {
++      file: 'src/components/dashboards/Dashboards.tsx',
++      mustInclude: [/StorageIopsTotals/, /StorageIopsPanel/, /telemetry\?\.storageIops/],
++    },
++    {
++      file: 'src/components/dashboards/ResourceMonitorHudView.tsx',
++      mustInclude: [/StorageIopsTotals/, /StorageIopsPanel/, /storageIops/],
++    },
++    {
++      file: 'src/components/dashboards/EnvironmentIntelHudView.tsx',
++      mustInclude: [/StorageIopsTotals/, /StorageIopsPanel/, /storageIops/],
++    },
++    {
++      file: 'src/components/dashboards/MissionControl.tsx',
++      mustInclude: [/StorageIopsTotals/, /StorageIopsPanel/, /storageIops/],
++    },
++    {
++      file: 'src/components/dashboards/TelemetryWave.tsx',
++      mustInclude: [/StorageIopsTotals/, /StorageIopsPanel/, /storageIops/],
++    },
++  ];
++
++  it.each(views)('$file wires storage IOPS metrics', ({ file, mustInclude }) => {
++    const text = src(file);
++    for (const pattern of mustInclude) {
++      expect(text).toMatch(pattern);
++    }
++  });
++
++  it('Storage dashboard does not present live CSI backend IOPS as measured zeros', () => {
++    const text = src('src/components/dashboards/Dashboards.tsx');
++    expect(text).toMatch(/isLive \? '—' : backend\.iops\.toLocaleString\(\)/);
++    expect(text).toMatch(/StorageIopsPanel summary=\{telemetry\?\.storageIops\}/);
++  });
++});
+diff --git a/installer/tests/host-metrics.test.ts b/installer/tests/host-metrics.test.ts
+new file mode 100644
+index 00000000..b69b9197
+--- /dev/null
++++ b/installer/tests/host-metrics.test.ts
+@@ -0,0 +1,166 @@
++/**
++ * Contract tests for installer/overlay/usr/lib/nexus/host_metrics.py disk IOPS.
++ *
++ * Fake /proc/diskstats + a writable sample file. No real storage hardware.
++ */
++
++import { execFileSync } from 'node:child_process';
++import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { dirname, join, resolve } from 'node:path';
++import { afterAll, describe, expect, it } from 'vitest';
++
++const MODULE = resolve(__dirname, '../overlay/usr/lib/nexus/host_metrics.py');
++const workdir = mkdtempSync(join(tmpdir(), 'nexus-host-metrics-'));
++
++afterAll(() => rmSync(workdir, { recursive: true, force: true }));
++
++function py<T>(snippet: string, env: Record<string, string> = {}): T {
++  const script = [
++    'import importlib.util, json, sys',
++    `spec = importlib.util.spec_from_file_location("hm", ${JSON.stringify(MODULE)})`,
++    'hm = importlib.util.module_from_spec(spec)',
++    'spec.loader.exec_module(hm)',
++    snippet,
++  ].join('\n');
++  const out = execFileSync('python3', ['-c', script], {
++    encoding: 'utf-8',
++    env: { ...process.env, ...env },
++  });
++  return JSON.parse(out) as T;
++}
++
++function write(path: string, contents: string): void {
++  mkdirSync(dirname(path), { recursive: true });
++  writeFileSync(path, contents);
++}
++
++function diskstatsLine(
++  name: string,
++  reads: number,
++  writes: number,
++  sectorsRead: number,
++  sectorsWrite: number,
++): string {
++  return ` 8 0 ${name} ${reads} 0 ${sectorsRead} 0 ${writes} 0 ${sectorsWrite} 0 0 0 0 0\n`;
++}
++
++describe('host_metrics · disk IOPS', () => {
++  it('returns null IOPS on the first sample and does not invent a rate', () => {
++    const root = join(workdir, 'first');
++    const proc = join(root, 'proc');
++    const sample = join(root, 'host-sample.json');
++    write(join(proc, 'diskstats'), diskstatsLine('sda', 100, 40, 800, 320));
++    write(join(proc, 'net/dev'), 'Inter-|   Receive\nface |bytes\neth0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n');
++
++    const metrics = py<{ totalIops: number | null; disks: unknown[]; sources: Record<string, string> }>(
++      [
++        `print(json.dumps(hm.collect_host_metrics(proc_root=${JSON.stringify(proc)}, sample_file=${JSON.stringify(sample)})))`,
++      ].join('\n'),
++    );
++    expect(metrics.totalIops).toBeNull();
++    expect(metrics.sources.totalIops).toMatch(/two samples|unavailable/);
++  });
++
++  it('differences two samples into read/write IOPS and MiB/s per real disk', () => {
++    const root = join(workdir, 'rate');
++    const proc = join(root, 'proc');
++    const sample = join(root, 'host-sample.json');
++    write(
++      join(proc, 'diskstats'),
++      diskstatsLine('sda', 100, 50, 800, 400) + diskstatsLine('sda1', 100, 50, 800, 400),
++    );
++    write(join(proc, 'net/dev'), 'Inter-|   Receive\nface |bytes\neth0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n');
++
++    py(`print(json.dumps(hm.collect_host_metrics(proc_root=${JSON.stringify(proc)}, sample_file=${JSON.stringify(sample)})))`);
++
++    write(
++      join(proc, 'diskstats'),
++      diskstatsLine('sda', 300, 150, 2400, 1200) + diskstatsLine('sda1', 300, 150, 2400, 1200),
++    );
++
++    const metrics = py<{
++      totalIops: number | null;
++      readIops: number | null;
++      writeIops: number | null;
++      readMiBs: number | null;
++      writeMiBs: number | null;
++      disks: Array<{ device: string; iops: number; readIops: number; writeIops: number }>;
++    }>(
++      [
++        'import time',
++        `sample = ${JSON.stringify(sample)}`,
++        'with open(sample, encoding="utf-8") as handle:',
++        '    prev = json.load(handle)',
++        'prev["timestamp"] = time.time() - 2.0',
++        'prev["disks"] = {"sda": [100, 50, 800, 400]}',
++        'with open(sample, "w", encoding="utf-8") as handle:',
++        '    json.dump(prev, handle)',
++        `print(json.dumps(hm.collect_host_metrics(proc_root=${JSON.stringify(proc)}, sample_file=sample)))`,
++      ].join('\n'),
++    );
++
++    expect(metrics.totalIops).toBeGreaterThan(0);
++    expect(metrics.readIops).toBeGreaterThan(0);
++    expect(metrics.writeIops).toBeGreaterThan(0);
++    expect(metrics.disks.map((d) => d.device)).toEqual(['sda']);
++    expect(metrics.disks[0].iops).toBe(metrics.totalIops);
++    // 200 reads + 100 writes over 2s = 150 IOPS
++    expect(metrics.totalIops).toBeCloseTo(150, 0);
++  });
++
++  it('does not count NVMe partitions or loop devices', () => {
++    const root = join(workdir, 'filter');
++    const proc = join(root, 'proc');
++    const sample = join(root, 'host-sample.json');
++    write(
++      join(proc, 'diskstats'),
++      diskstatsLine('nvme0n1', 10, 10, 80, 80)
++        + diskstatsLine('nvme0n1p1', 10, 10, 80, 80)
++        + diskstatsLine('loop0', 99, 99, 800, 800),
++    );
++    write(join(proc, 'net/dev'), 'Inter-|   Receive\nface |bytes\neth0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n');
++    py(`print(json.dumps(hm.collect_host_metrics(proc_root=${JSON.stringify(proc)}, sample_file=${JSON.stringify(sample)})))`);
++    write(
++      sample,
++      JSON.stringify({
++        timestamp: Date.now() / 1000 - 1,
++        disks: { nvme0n1: [10, 10, 80, 80] },
++      }),
++    );
++    write(
++      join(proc, 'diskstats'),
++      diskstatsLine('nvme0n1', 20, 20, 160, 160)
++        + diskstatsLine('nvme0n1p1', 20, 20, 160, 160)
++        + diskstatsLine('loop0', 199, 199, 1600, 1600),
++    );
++
++    const metrics = py<{ disks: Array<{ device: string }>; totalIops: number | null }>(
++      `print(json.dumps(hm.collect_host_metrics(proc_root=${JSON.stringify(proc)}, sample_file=${JSON.stringify(sample)})))`,
++    );
++    expect(metrics.disks.map((d) => d.device)).toEqual(['nvme0n1']);
++  });
++
++  it('measures this host after two samples and never invents a CSI backend rate', () => {
++    const sample = join(workdir, 'live-host-sample.json');
++    const first = py<{ totalIops: number | null; disks: unknown[] }>(
++      `print(json.dumps(hm.collect_host_metrics(sample_file=${JSON.stringify(sample)})))`,
++    );
++    expect(first.totalIops).toBeNull();
++
++    execFileSync('python3', ['-c', 'import time; time.sleep(1.05)']);
++
++    const second = py<{
++      totalIops: number | null;
++      disks: Array<{ device: string }>;
++      sources: Record<string, string>;
++    }>(`print(json.dumps(hm.collect_host_metrics(sample_file=${JSON.stringify(sample)})))`);
++
++    if (second.disks.length > 0) {
++      expect(typeof second.totalIops).toBe('number');
++      expect(second.sources.totalIops).toMatch(/diskstats/);
++    } else {
++      expect(second.totalIops).toBeNull();
++    }
++  }, 15000);
++});
+diff --git a/installer/tests/installer.test.ts b/installer/tests/installer.test.ts
+index 4826acc3..db36d730 100644
+--- a/installer/tests/installer.test.ts
++++ b/installer/tests/installer.test.ts
+@@ -394,8 +394,10 @@ describe('installer · overlay avoids Elemental /usr/local persistent mount', ()
+     expect(serve).toMatch(/\/api\/v1\/telemetry\/accelerators/);
+     const metricsSrc = readFileSync(metrics, 'utf8');
+     expect(metricsSrc).toMatch(/"accelerators": accelerators/);
++    expect(metricsSrc).toMatch(/"storageIops": _storage_iops_from_host\(host\)/);
+     const dash = readFileSync(join(INSTALLER, 'overlay', 'usr', 'lib', 'nexus', 'dashboard_collectors.py'), 'utf8');
+     expect(dash).toMatch(/"accelerators": _collect_accelerator_summary\(\)/);
++    expect(dash).toMatch(/"storageIops": _storage_iops_from_host\(host\)/);
+     expect(dash).toMatch(/_parse_cpu_cores/);
+   });
+ });
+diff --git a/src/components/EnvironmentTicker.tsx b/src/components/EnvironmentTicker.tsx
+index d2c6f4c4..d89b4ca4 100644
+--- a/src/components/EnvironmentTicker.tsx
++++ b/src/components/EnvironmentTicker.tsx
+@@ -1,7 +1,9 @@
+ import { useEffect, useMemo, useRef, useState } from 'react';
+ import { formatNumber, type EnvironmentSnapshot } from '../lib/liveTelemetry';
++import { formatMetric } from '../lib/telemetry/environmentAdapter';
+ import type { TelemetryMode, TelemetryState } from '../lib/telemetry/mode';
+ import { hardwareTickerCells } from '../lib/telemetry/hardwareAddOn';
++import { storageIopsTickerCells } from '../lib/telemetry/storageIops';
+ 
+ interface EnvironmentTickerProps {
+   snapshot: EnvironmentSnapshot;
+@@ -46,35 +48,40 @@ export function EnvironmentTicker({
+       {
+         key: 'totalIops',
+         label: 'Cluster IOPS',
+-        value: formatNumber(snapshot.totalIops, { compact: true }),
+-        sub: 'all storage backends',
++        value: formatMetric(snapshot, 'totalIops', (v) => formatNumber(v, { compact: true })),
++        sub: snapshot.storageIops?.source?.includes('diskstats')
++          ? '/proc/diskstats'
++          : snapshot.unavailableMetrics?.includes('totalIops')
++            ? 'waiting for sample'
++            : 'physical disks',
+         delta: snapshot.deltas.totalIops,
+       },
++      ...storageIopsTickerCells(snapshot.storageIops),
+       {
+         key: 'ingressMbps',
+         label: 'Ingress Mb/s',
+-        value: formatNumber(snapshot.ingressMbps),
++        value: formatMetric(snapshot, 'ingressMbps', (v) => formatNumber(v)),
+         sub: 'NIC bonds aggregated',
+         delta: snapshot.deltas.ingressMbps,
+       },
+       {
+         key: 'egressMbps',
+         label: 'Egress Mb/s',
+-        value: formatNumber(snapshot.egressMbps),
++        value: formatMetric(snapshot, 'egressMbps', (v) => formatNumber(v)),
+         sub: 'NIC bonds aggregated',
+         delta: snapshot.deltas.egressMbps,
+       },
+       {
+         key: 'cpuPercent',
+         label: 'CPU %',
+-        value: `${snapshot.cpuPercent}%`,
++        value: formatMetric(snapshot, 'cpuPercent', (v) => `${v}%`),
+         sub: 'rolling cluster avg',
+         delta: snapshot.deltas.cpuPercent,
+       },
+       {
+         key: 'ramPercent',
+         label: 'DRAM %',
+-        value: `${snapshot.ramPercent}%`,
++        value: formatMetric(snapshot, 'ramPercent', (v) => `${v}%`),
+         sub: 'rolling cluster avg',
+         delta: snapshot.deltas.ramPercent,
+       },
+@@ -82,7 +89,7 @@ export function EnvironmentTicker({
+       {
+         key: 'watts',
+         label: 'Power',
+-        value: `${formatNumber(snapshot.watts)} W`,
++        value: formatMetric(snapshot, 'watts', (v) => `${formatNumber(v)} W`),
+         sub: 'aggregate draw',
+         delta: snapshot.deltas.watts,
+       },
+diff --git a/src/components/dashboards/Dashboards.tsx b/src/components/dashboards/Dashboards.tsx
+index bccd9607..783f8bd6 100644
+--- a/src/components/dashboards/Dashboards.tsx
++++ b/src/components/dashboards/Dashboards.tsx
+@@ -21,6 +21,8 @@ import { ConsoleSession } from '../ConsoleSession';
+ import { DemoCatalogPlaceholder, LiveEmptyPanel } from './LiveEmptyPanel';
+ import { ClusterRadar, ThreatIntelMap, WidgetTitle } from './Widgets';
+ import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
++import { StorageIopsPanel, StorageIopsTotals } from './StorageIopsMetrics';
++import { formatMetric } from '../../lib/telemetry/environmentAdapter';
+ import {
+   ChordDiagram,
+   ChordWithStats,
+@@ -749,7 +751,16 @@ export function StorageDashboardView({ telemetry, dataSource, storageDashboard,
+         </div>
+         <div className="dash-totals">
+           <div><span>Capacity</span><strong>{isLive ? '—' : `${backends.reduce((sum, b) => sum + b.capacityTiB, 0)} TiB`}</strong></div>
+-          <div><span>IOPS</span><strong><LiveValue value={isLive ? (telemetry?.totalIops?.toLocaleString() ?? '0') : `${(liveBackends.reduce((sum, b) => sum + b.iops, 0) / 1000).toFixed(1)} K`} /></strong></div>
++          {isLive ? (
++            <StorageIopsTotals summary={telemetry?.storageIops} />
++          ) : (
++            <div>
++              <span>IOPS</span>
++              <strong>
++                <LiveValue value={`${(liveBackends.reduce((sum, b) => sum + b.iops, 0) / 1000).toFixed(1)} K`} />
++              </strong>
++            </div>
++          )}
+           {onConfigureStorage && (
+             <button type="button" className="primary-btn dash-action-btn" onClick={onConfigureStorage}>
+               Configure storage
+@@ -758,6 +769,8 @@ export function StorageDashboardView({ telemetry, dataSource, storageDashboard,
+         </div>
+       </header>
+ 
++      <StorageIopsPanel summary={telemetry?.storageIops} />
++
+       {!isLive && (
+       <>
+       <article className="dash-panel">
+@@ -852,9 +865,9 @@ export function StorageDashboardView({ telemetry, dataSource, storageDashboard,
+                 <text x="50" y="62" textAnchor="middle" className="radial-sub">{backend.capacityTiB}TiB</text>
+               </svg>
+               <dl className="backend-stats">
+-                <div><dt>IOPS</dt><dd><LiveValue value={backend.iops.toLocaleString()} /></dd></div>
+-                <div><dt>R</dt><dd>{backend.readMiBs} MiB/s</dd></div>
+-                <div><dt>W</dt><dd>{backend.writeMiBs} MiB/s</dd></div>
++                <div><dt>IOPS</dt><dd><LiveValue value={isLive ? '—' : backend.iops.toLocaleString()} /></dd></div>
++                <div><dt>R</dt><dd>{isLive ? '—' : `${backend.readMiBs} MiB/s`}</dd></div>
++                <div><dt>W</dt><dd>{isLive ? '—' : `${backend.writeMiBs} MiB/s`}</dd></div>
+               </dl>
+               <div className="backend-features">
+                 {backend.features.map((feat) => <span key={feat}>{feat}</span>)}
+@@ -1200,6 +1213,7 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource, processorM
+             <div><span>Demotion</span><strong>{extra?.demotionEnabled == null ? '—' : extra.demotionEnabled ? 'on' : 'off'}</strong></div>
+           ) : null}
+           <HardwareAddOnTotals summary={telemetry?.accelerators} />
++          <StorageIopsTotals summary={telemetry?.storageIops} />
+         </div>
+       </header>
+ 
+@@ -1298,6 +1312,7 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource, processorM
+       </div>
+ 
+       <HardwareAddOnPanel summary={telemetry?.accelerators} />
++      <StorageIopsPanel summary={telemetry?.storageIops} />
+ 
+       {isLive && extra?.vmstat ? (
+         <div className="dash-row dash-row-2">
+@@ -1368,10 +1383,11 @@ export function OperationsDashboardView({ telemetry, dataSource, operationsLinks
+         <div className="dash-totals">
+           {isLive ? (
+             <>
+-              <div><span>CPU</span><strong><LiveValue value={`${telemetry?.cpuPercent?.toFixed(1) ?? '0'}%`} /></strong></div>
+-              <div><span>RAM</span><strong><LiveValue value={`${telemetry?.ramPercent?.toFixed(1) ?? '0'}%`} /></strong></div>
+-              <div><span>Est. watts</span><strong><LiveValue value={telemetry?.watts ?? 0} /></strong></div>
++              <div><span>CPU</span><strong><LiveValue value={formatMetric(telemetry, 'cpuPercent', (v) => `${v.toFixed(1)}%`)} /></strong></div>
++              <div><span>RAM</span><strong><LiveValue value={formatMetric(telemetry, 'ramPercent', (v) => `${v.toFixed(1)}%`)} /></strong></div>
++              <div><span>Est. watts</span><strong><LiveValue value={formatMetric(telemetry, 'watts', (v) => String(v))} /></strong></div>
+               <HardwareAddOnTotals summary={telemetry?.accelerators} />
++              <StorageIopsTotals summary={telemetry?.storageIops} />
+             </>
+           ) : (
+             <>
+@@ -1406,9 +1422,10 @@ export function OperationsDashboardView({ telemetry, dataSource, operationsLinks
+       {isLive ? (
+         <>
+           <HardwareAddOnPanel summary={telemetry?.accelerators} />
++          <StorageIopsPanel summary={telemetry?.storageIops} />
+           <LiveEmptyPanel
+             title="Compliance and chargeback panels are demo-only"
+-            detail="Live mode shows cluster CPU/RAM/watts, PCI add-in cards, and Harvester Grafana links above. Open Grafana for CVE, audit, GitOps, and backup metrics from rancher-monitoring."
++            detail="Live mode shows cluster CPU/RAM/watts, PCI add-in cards, disk IOPS from /proc/diskstats, and Harvester Grafana links above. Open Grafana for CVE, audit, GitOps, and backup metrics from rancher-monitoring."
+           />
+         </>
+       ) : (
+diff --git a/src/components/dashboards/EnvironmentIntelHudView.tsx b/src/components/dashboards/EnvironmentIntelHudView.tsx
+index e279c45e..4d44b54e 100644
+--- a/src/components/dashboards/EnvironmentIntelHudView.tsx
++++ b/src/components/dashboards/EnvironmentIntelHudView.tsx
+@@ -26,6 +26,8 @@ import {
+ } from './Widgets';
+ import { HologramHudShell } from './HologramHudShell';
+ import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
++import { StorageIopsPanel, StorageIopsTotals } from './StorageIopsMetrics';
++import { formatMetric } from '../../lib/telemetry/environmentAdapter';
+ import {
+   ConnectedColumnChart,
+   HudEventStrip,
+@@ -119,6 +121,7 @@ export function EnvironmentIntelHudView({
+           <div><span>Power</span><strong>{Math.round(effectiveTelemetry?.watts ?? 0)}W</strong></div>
+           <div><span>Airflow</span><strong>{fmtMb(effectiveTelemetry?.ingressMbps ?? 0)}</strong></div>
+           <HardwareAddOnTotals summary={effectiveTelemetry?.accelerators} />
++          <StorageIopsTotals summary={effectiveTelemetry?.storageIops} />
+         </div>
+       </header>
+ 
+@@ -139,7 +142,7 @@ export function EnvironmentIntelHudView({
+           <KpiTile label="AIR" value={fmtMb(effectiveTelemetry?.ingressMbps ?? 0)} size="sm" series={airSeries} status="warn" />
+         </HudTile>
+         <HudTile label="DISK" className="holo-gauge">
+-          <KpiTile label="DSK" value={fmtK(effectiveTelemetry?.totalIops ?? 0)} unit="IOPS" size="sm" series={diskSeries} />
++          <KpiTile label="DSK" value={formatMetric(effectiveTelemetry, 'totalIops', fmtK)} unit="IOPS" size="sm" series={diskSeries} />
+         </HudTile>
+         <HudTile label="HUMIDITY" className="holo-gauge-sm">
+           <KpiTile label="HUM" value={fmtPct(effectiveTelemetry?.ramPercent ?? 43)} size="sm" series={humSeries} />
+@@ -295,6 +298,9 @@ export function EnvironmentIntelHudView({
+         <HudTile label="Add-in cards" className="holo-table wide">
+           <HardwareAddOnPanel summary={effectiveTelemetry?.accelerators} />
+         </HudTile>
++        <HudTile label="Disk IOPS" className="holo-table wide">
++          <StorageIopsPanel summary={effectiveTelemetry?.storageIops} />
++        </HudTile>
+       </div>
+       </HologramHudShell>
+     </section>
+diff --git a/src/components/dashboards/MissionControl.tsx b/src/components/dashboards/MissionControl.tsx
+index 1420d9ac..f05f9e9b 100644
+--- a/src/components/dashboards/MissionControl.tsx
++++ b/src/components/dashboards/MissionControl.tsx
+@@ -2,6 +2,8 @@ import { useMemo } from 'react';
+ import type { EnvironmentSnapshot } from '../../lib/liveTelemetry';
+ import { MissionCustomizableArea } from './MissionCustomizableArea';
+ import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
++import { StorageIopsPanel, StorageIopsTotals } from './StorageIopsMetrics';
++import { formatMetric } from '../../lib/telemetry/environmentAdapter';
+ import { summarizeFromPassThrough } from '../../lib/telemetry/hardwareAddOn';
+ import {
+   buildAccelerationDashboard,
+@@ -87,9 +89,10 @@ function LiveMissionControl({
+         <div className="dash-totals">
+           <div><span>User workloads</span><strong>{telemetry?.totalWorkloads ?? 0}</strong></div>
+           <div><span>Migrations</span><strong>{telemetry?.activeMigrations ?? 0}</strong></div>
+-          <div><span>CPU</span><strong>{telemetry?.cpuPercent?.toFixed(1) ?? '0'}%</strong></div>
+-          <div><span>RAM</span><strong>{telemetry?.ramPercent?.toFixed(1) ?? '0'}%</strong></div>
++          <div><span>CPU</span><strong>{formatMetric(telemetry, 'cpuPercent', (v) => `${v.toFixed(1)}%`)}</strong></div>
++          <div><span>RAM</span><strong>{formatMetric(telemetry, 'ramPercent', (v) => `${v.toFixed(1)}%`)}</strong></div>
+           <HardwareAddOnTotals summary={telemetry?.accelerators} />
++          <StorageIopsTotals summary={telemetry?.storageIops} />
+         </div>
+       </header>
+       <div className="dash-row dash-row-2">
+@@ -117,6 +120,7 @@ function LiveMissionControl({
+       <HardwareAddOnPanel
+         summary={telemetry?.accelerators ?? (acceleration ? summarizeFromPassThrough(acceleration.passThrough, acceleration.waitingForHardware) : undefined)}
+       />
++      <StorageIopsPanel summary={telemetry?.storageIops} />
+     </section>
+   );
+ }
+@@ -337,10 +341,11 @@ export function MissionControlView({ telemetry, dataSource, acceleration }: Miss
+         </div>
+         <div className="dash-totals">
+           <div><span>Workloads</span><strong>{telemetry?.totalWorkloads ?? 642}</strong></div>
+-          <div><span>IOPS</span><strong>{telemetry ? `${(telemetry.totalIops / 1000).toFixed(0)}K` : '1.12M'}</strong></div>
++          <div><span>IOPS</span><strong>{formatMetric(telemetry, 'totalIops', (v) => `${(v / 1000).toFixed(0)}K`, '1.12M')}</strong></div>
+           <div><span>Watts</span><strong>{telemetry?.watts ?? 1592}</strong></div>
+           <div><span>Trust</span><strong>{telemetry?.trustScore ?? 87}</strong></div>
+           <HardwareAddOnTotals summary={telemetry?.accelerators} />
++          <StorageIopsTotals summary={telemetry?.storageIops} />
+         </div>
+       </header>
+ 
+@@ -354,7 +359,7 @@ export function MissionControlView({ telemetry, dataSource, acceleration }: Miss
+           hint={telemetry?.accelerators?.hottestC == null ? 'PCI add-in cards' : `hottest ${telemetry.accelerators.hottestC}°C`}
+           status={(telemetry?.accelerators?.issues ?? 0) > 0 ? 'warn' : 'good'}
+         />
+-        <KpiTile label="Cluster IOPS" value={telemetry ? `${(telemetry.totalIops / 1000).toFixed(0)}` : '1120'} unit="K" delta={telemetry ? Math.round(telemetry.deltas.totalIops / 1000) : 0} series={iopsSeries} hint="Ceph · NVMe-oF · Vitastor" status="good" />
++        <KpiTile label="Cluster IOPS" value={formatMetric(telemetry, 'totalIops', (v) => `${(v / 1000).toFixed(0)}`, '1120')} unit="K" delta={telemetry && !telemetry.unavailableMetrics?.includes('totalIops') ? Math.round(telemetry.deltas.totalIops / 1000) : 0} series={iopsSeries} hint="physical disks · /proc/diskstats" status="good" />
+         <KpiTile label="Power" value={`${telemetry?.watts ?? 1592}`} unit="W" delta={telemetry?.deltas.watts} series={wattsSeries} hint="aggregate node draw" />
+         <KpiTile label="Ingress" value={telemetry ? `${(telemetry.ingressMbps / 1000).toFixed(1)}` : '78.4'} unit="Gb/s" delta={telemetry ? Math.round(telemetry.deltas.ingressMbps / 1000) : 0} series={ingressSeries} hint="NIC bonds aggregated" />
+         <KpiTile label="Egress" value={telemetry ? `${(telemetry.egressMbps / 1000).toFixed(1)}` : '74.8'} unit="Gb/s" delta={telemetry ? Math.round(telemetry.deltas.egressMbps / 1000) : 0} series={egressSeries} hint="NIC bonds aggregated" />
+@@ -362,6 +367,8 @@ export function MissionControlView({ telemetry, dataSource, acceleration }: Miss
+         <KpiTile label="Open CVE" value={`${telemetry?.openCves ?? 17}`} hint="critical & high" status="warn" />
+       </div>
+ 
++      <StorageIopsPanel summary={telemetry?.storageIops} />
++
+       <MissionCustomizableArea>
+         <article key="radial" className="dash-panel mission-radial">
+           <WidgetTitle kicker="POSTURE" title="Cluster posture rings" trailing={<span className="osc-readout">tick #{telemetry?.tick ?? 0}</span>} />
+diff --git a/src/components/dashboards/ResourceMonitorHudView.tsx b/src/components/dashboards/ResourceMonitorHudView.tsx
+index 27269439..b026e357 100644
+--- a/src/components/dashboards/ResourceMonitorHudView.tsx
++++ b/src/components/dashboards/ResourceMonitorHudView.tsx
+@@ -25,6 +25,8 @@ import {
+ } from './Widgets';
+ import { HologramHudShell } from './HologramHudShell';
+ import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
++import { StorageIopsPanel, StorageIopsTotals } from './StorageIopsMetrics';
++import { formatMetric } from '../../lib/telemetry/environmentAdapter';
+ import {
+   ConnectedColumnChart,
+   HudEventStrip,
+@@ -114,6 +116,7 @@ export function ResourceMonitorHudView({
+           <div><span>CPU</span><strong>{fmtPct(effectiveTelemetry?.cpuPercent ?? model.nodes[0]?.cpu ?? 0)}</strong></div>
+           <div><span>Active ops</span><strong>{resourceMonitoring?.workItems.length ?? effectiveTelemetry?.activeMigrations ?? 0}</strong></div>
+           <HardwareAddOnTotals summary={effectiveTelemetry?.accelerators} />
++          <StorageIopsTotals summary={effectiveTelemetry?.storageIops} />
+         </div>
+       </header>
+ 
+@@ -144,7 +147,7 @@ export function ResourceMonitorHudView({
+           />
+         </HudTile>
+         <HudTile label="DISK" className="holo-gauge">
+-          <KpiTile label="DSK" value={fmtK(effectiveTelemetry?.totalIops ?? 0)} unit="IOPS" size="sm" series={diskSeries} />
++          <KpiTile label="DSK" value={formatMetric(effectiveTelemetry, 'totalIops', fmtK)} unit="IOPS" size="sm" series={diskSeries} />
+         </HudTile>
+         <HudTile label="NET RX" className="holo-gauge">
+           <KpiTile label="RX" value={fmtMb(effectiveTelemetry?.ingressMbps ?? 0)} size="sm" series={netSeries} status="warn" />
+@@ -300,6 +303,9 @@ export function ResourceMonitorHudView({
+         <HudTile label="Add-in cards" className="holo-table holo-accel">
+           <HardwareAddOnPanel summary={effectiveTelemetry?.accelerators} />
+         </HudTile>
++        <HudTile label="Disk IOPS" className="holo-table holo-storage">
++          <StorageIopsPanel summary={effectiveTelemetry?.storageIops} />
++        </HudTile>
+       </div>
+       </HologramHudShell>
+     </section>
+diff --git a/src/components/dashboards/StorageIopsMetrics.tsx b/src/components/dashboards/StorageIopsMetrics.tsx
+new file mode 100644
+index 00000000..828f0777
+--- /dev/null
++++ b/src/components/dashboards/StorageIopsMetrics.tsx
+@@ -0,0 +1,72 @@
++import type { EnvironmentStorageIops } from '../../lib/telemetry/storageIops';
++import { formatDiskMetric, storageIopsTotals } from '../../lib/telemetry/storageIops';
++import { WidgetTitle } from './Widgets';
++
++export function StorageIopsTotals({
++  summary,
++}: {
++  summary?: EnvironmentStorageIops;
++}) {
++  return (
++    <>
++      {storageIopsTotals(summary).map((row) => (
++        <div key={row.label}>
++          <span>{row.label}</span>
++          <strong>{row.value}</strong>
++        </div>
++      ))}
++    </>
++  );
++}
++
++export function StorageIopsPanel({
++  summary,
++  title = 'Local disk IOPS',
++}: {
++  summary?: EnvironmentStorageIops;
++  title?: string;
++}) {
++  const disks = summary?.devices ?? [];
++  const waiting = summary?.totalIops == null;
++  const source = summary?.source ?? 'unavailable';
++  return (
++    <article className="dash-panel storage-iops-panel" aria-label="Local disk IOPS">
++      <WidgetTitle
++        kicker="DISK IO"
++        title={title}
++        trailing={
++          <span className="osc-readout">
++            {waiting ? '—' : `${formatDiskMetric(summary?.totalIops)} IOPS`}
++            {' · '}
++            {source}
++          </span>
++        }
++      />
++      {waiting ? (
++        <p>
++          Waiting for a second <code>/proc/diskstats</code> sample so IOPS can be measured (not estimated).
++        </p>
++      ) : disks.length === 0 ? (
++        <p>No local disks reported I/O in <code>/proc/diskstats</code>.</p>
++      ) : (
++        <ul className="passthrough-list storage-iops-list">
++          {disks.map((disk) => (
++            <li key={disk.device}>
++              <span className="kind-chip">disk</span>
++              <strong>{disk.device}</strong>
++              <small>
++                {formatDiskMetric(disk.iops)} IOPS
++                {' · R '}
++                {formatDiskMetric(disk.readIops)}
++                {' · W '}
++                {formatDiskMetric(disk.writeIops)}
++                {' · '}
++                {formatDiskMetric(disk.readMiBs, 2)} / {formatDiskMetric(disk.writeMiBs, 2)} MiB/s
++              </small>
++            </li>
++          ))}
++        </ul>
++      )}
++    </article>
++  );
++}
+diff --git a/src/components/dashboards/TelemetryWave.tsx b/src/components/dashboards/TelemetryWave.tsx
+index 586d4bd5..9e9f62eb 100644
+--- a/src/components/dashboards/TelemetryWave.tsx
++++ b/src/components/dashboards/TelemetryWave.tsx
+@@ -20,6 +20,8 @@ import {
+ import type { TelemetryDataSource } from '../../lib/telemetry/dashboardAdapters';
+ import { DemoCatalogPlaceholder } from './LiveEmptyPanel';
+ import { HardwareAddOnPanel, HardwareAddOnTotals } from './HardwareAddOnMetrics';
++import { StorageIopsPanel, StorageIopsTotals } from './StorageIopsMetrics';
++import { formatMetric } from '../../lib/telemetry/environmentAdapter';
+ 
+ const accel = buildAccelerationDashboard();
+ 
+@@ -131,6 +133,7 @@ export function TelemetryWaveView({ telemetry, dataSource }: TelemetryWaveProps
+           <div><span>Pass-thru</span><strong>{telemetry?.accelerators?.cards ?? accel.passThrough.length}</strong></div>
+           <div><span>Sample rate</span><strong>1.6 s/div</strong></div>
+           <HardwareAddOnTotals summary={telemetry?.accelerators} />
++          <StorageIopsTotals summary={telemetry?.storageIops} />
+         </div>
+       </header>
+ 
+@@ -140,7 +143,7 @@ export function TelemetryWaveView({ telemetry, dataSource }: TelemetryWaveProps
+           items={[
+             { label: 'NIC RX', value: telemetry ? (telemetry.ingressMbps / 1000).toFixed(1) : '78.4', unit: 'Gb/s', delta: telemetry ? telemetry.deltas.ingressMbps / 1000 : 0, status: 'good' },
+             { label: 'NIC TX', value: telemetry ? (telemetry.egressMbps / 1000).toFixed(1) : '74.8', unit: 'Gb/s', delta: telemetry ? telemetry.deltas.egressMbps / 1000 : 0, status: 'good' },
+-            { label: 'IOPS', value: telemetry ? (telemetry.totalIops / 1000).toFixed(0) : '1120', unit: 'K', delta: telemetry ? telemetry.deltas.totalIops / 1000 : 0, status: 'good' },
++            { label: 'IOPS', value: formatMetric(telemetry, 'totalIops', (v) => (v / 1000).toFixed(0), '1120'), unit: 'K', delta: telemetry && !telemetry.unavailableMetrics?.includes('totalIops') ? telemetry.deltas.totalIops / 1000 : 0, status: 'good' },
+             { label: 'CPU', value: `${telemetry?.cpuPercent ?? 58}`, unit: '%', delta: telemetry?.deltas.cpuPercent, status: 'neutral' },
+             { label: 'DRAM', value: `${telemetry?.ramPercent ?? 64}`, unit: '%', delta: telemetry?.deltas.ramPercent, status: 'neutral' },
+             { label: 'ACCEL', value: `${telemetry?.accelerators?.cards ?? accel.passThrough.length}`, unit: 'cards', status: (telemetry?.accelerators?.issues ?? 0) > 0 ? 'warn' : 'good' },
+@@ -157,7 +160,7 @@ export function TelemetryWaveView({ telemetry, dataSource }: TelemetryWaveProps
+           <AnnotatedOscilloscope channels={dpdkChannels} snapshot={telemetry} height={210} divisionsX={10} divisionsY={8} timeScale="1.6 s / div" voltScale="12.5 % / div" />
+         </article>
+         <article className="dash-panel wave-osc-panel">
+-          <WidgetTitle kicker="SPDK" title="Userspace NVMe-oF queues" trailing={<span className="osc-readout">{telemetry ? `${(telemetry.totalIops / 1000).toFixed(0)}K` : '1120K'} IOPS</span>} />
++          <WidgetTitle kicker="SPDK" title="Userspace NVMe-oF queues" trailing={<span className="osc-readout">{formatMetric(telemetry, 'totalIops', (v) => `${(v / 1000).toFixed(0)}K`, '1120K')} IOPS</span>} />
+           <AnnotatedOscilloscope channels={spdkChannels} snapshot={telemetry} height={210} divisionsX={10} divisionsY={8} timeScale="1.6 s / div" voltScale="queue-util" />
+         </article>
+         <article className="dash-panel wave-osc-panel">
+@@ -259,6 +262,7 @@ export function TelemetryWaveView({ telemetry, dataSource }: TelemetryWaveProps
+       </article>
+ 
+       <HardwareAddOnPanel summary={telemetry?.accelerators} />
++      <StorageIopsPanel summary={telemetry?.storageIops} />
+     </section>
+   );
+ }
+diff --git a/src/lib/liveTelemetry.test.ts b/src/lib/liveTelemetry.test.ts
+index 761be7dc..57a0d1a5 100644
+--- a/src/lib/liveTelemetry.test.ts
++++ b/src/lib/liveTelemetry.test.ts
+@@ -22,6 +22,13 @@ describe('nextSnapshot', () => {
+     expect(snap.accelerators?.byKind.fpga).toBeGreaterThan(0);
+   });
+ 
++  it('includes demo per-disk IOPS on the same snapshot as CPU and DRAM', () => {
++    const snap = nextSnapshot();
++    expect(snap.storageIops?.totalIops).toBe(1_120_000);
++    expect(snap.storageIops?.devices.length).toBeGreaterThan(0);
++    expect(snap.storageIops?.source).toBe('demo');
++  });
++
+   it('keeps the same demo accelerator inventory across ticks', () => {
+     const first = nextSnapshot();
+     const second = nextSnapshot(first);
+@@ -58,6 +65,9 @@ describe('emptyEnvironmentSnapshot', () => {
+     expect(snap.accelerators?.cards).toBe(0);
+     expect(snap.accelerators?.hottestC).toBeNull();
+     expect(snap.accelerators?.devices).toEqual([]);
++    expect(snap.storageIops?.totalIops).toBeNull();
++    expect(snap.storageIops?.devices).toEqual([]);
++    expect(snap.unavailableMetrics).toContain('totalIops');
+   });
+ });
+ describe('formatNumber', () => {
+diff --git a/src/lib/liveTelemetry.ts b/src/lib/liveTelemetry.ts
+index e9161aff..7fcec2b5 100644
+--- a/src/lib/liveTelemetry.ts
++++ b/src/lib/liveTelemetry.ts
+@@ -1,5 +1,6 @@
+ import { useEffect, useRef, useState } from 'react';
+ import { demoAcceleratorSummary, type EnvironmentAcceleratorSummary } from './telemetry/hardwareAddOn';
++import { demoStorageIops, type EnvironmentStorageIops } from './telemetry/storageIops';
+ 
+ export interface EnvironmentSnapshot {
+   /** Total monitored workloads (vm + lxc + pod + docker) across the synthetic environment */
+@@ -33,6 +34,8 @@ export interface EnvironmentSnapshot {
+   metricSources?: Record<string, string>;
+   /** FPGA / GPU / NPU / TPU pulse collected with CPU / RAM. */
+   accelerators?: EnvironmentAcceleratorSummary;
++  /** Per-disk IOPS collected with CPU / RAM. */
++  storageIops?: EnvironmentStorageIops;
+   /** Rolling deltas vs previous tick (positive or negative) */
+   deltas: {
+     totalWorkloads: number;
+@@ -60,6 +63,7 @@ const BASE_SNAPSHOT: Omit<EnvironmentSnapshot, 'deltas' | 'tick'> = {
+   openCves: 17,
+   trustScore: 87,
+   accelerators: demoAcceleratorSummary(),
++  storageIops: demoStorageIops(),
+ };
+ 
+ function clamp(value: number, min: number, max: number): number {
+@@ -94,6 +98,7 @@ export function nextSnapshot(prev?: EnvironmentSnapshot): EnvironmentSnapshot {
+     openCves: seed.openCves,
+     trustScore: seed.trustScore,
+     accelerators: seed.accelerators ?? demoAcceleratorSummary(),
++    storageIops: seed.storageIops ?? demoStorageIops(),
+     deltas: {
+       totalWorkloads: totalWorkloads - seed.totalWorkloads,
+       totalIops: totalIops - seed.totalIops,
+diff --git a/src/lib/telemetry/emptySnapshot.ts b/src/lib/telemetry/emptySnapshot.ts
+index bf6674b9..094ae1cf 100644
+--- a/src/lib/telemetry/emptySnapshot.ts
++++ b/src/lib/telemetry/emptySnapshot.ts
+@@ -21,6 +21,25 @@ export function emptyEnvironmentSnapshot(tick = 0): EnvironmentSnapshot {
+       waitingForHardware: [],
+       devices: [],
+     },
++    storageIops: {
++      totalIops: null,
++      readIops: null,
++      writeIops: null,
++      readMiBs: null,
++      writeMiBs: null,
++      devices: [],
++      source: 'unavailable',
++    },
++    unavailableMetrics: [
++      'totalIops',
++      'ingressMbps',
++      'egressMbps',
++      'cpuPercent',
++      'ramPercent',
++      'watts',
++      'openCves',
++      'trustScore',
++    ],
+     deltas: {
+       totalWorkloads: 0,
+       totalIops: 0,
+diff --git a/src/lib/telemetry/environmentAdapter.ts b/src/lib/telemetry/environmentAdapter.ts
+index 22f8cf3d..0bf5a2f4 100644
+--- a/src/lib/telemetry/environmentAdapter.ts
++++ b/src/lib/telemetry/environmentAdapter.ts
+@@ -54,6 +54,7 @@ export function payloadToEnvironmentSnapshot(
+     unavailableMetrics,
+     metricSources: payload.metricSources,
+     accelerators: payload.accelerators,
++    storageIops: payload.storageIops,
+   };
+ 
+   if (!previous) {
+diff --git a/src/lib/telemetry/storageIops.test.ts b/src/lib/telemetry/storageIops.test.ts
+new file mode 100644
+index 00000000..e1118638
+--- /dev/null
++++ b/src/lib/telemetry/storageIops.test.ts
+@@ -0,0 +1,133 @@
++import { describe, expect, it } from 'vitest';
++import { formatMetric, payloadToEnvironmentSnapshot } from './environmentAdapter';
++import { storageIopsTickerCells, storageIopsTotals, summarizeStorageIops } from './storageIops';
++import type { EnvironmentTelemetryPayload } from './types';
++
++function payload(overrides: Partial<EnvironmentTelemetryPayload> = {}): EnvironmentTelemetryPayload {
++  return {
++    totalWorkloads: 1,
++    totalIops: 150,
++    ingressMbps: 1,
++    egressMbps: 1,
++    cpuPercent: 10,
++    ramPercent: 20,
++    watts: 100,
++    activeMigrations: 0,
++    openCves: 0,
++    trustScore: 80,
++    tick: 1,
++    source: 'mixed',
++    clusterReady: true,
++    monitoringEnabled: false,
++    nodeCount: 1,
++    podCount: 1,
++    vmCount: 0,
++    ...overrides,
++  };
++}
++
++describe('summarizeStorageIops', () => {
++  it('keeps measured disk IOPS and does not invent backend CSI rates', () => {
++    const summary = summarizeStorageIops({
++      totalIops: 150,
++      readIops: 100,
++      writeIops: 50,
++      readMiBs: 12.4,
++      writeMiBs: 6.2,
++      devices: [
++        { device: 'sda', iops: 150, readIops: 100, writeIops: 50, readMiBs: 12.4, writeMiBs: 6.2 },
++      ],
++      source: '/proc/diskstats',
++    });
++    expect(summary.totalIops).toBe(150);
++    expect(summary.devices).toHaveLength(1);
++    expect(summary.devices[0].device).toBe('sda');
++  });
++
++  it('keeps totals null when the host could not measure a rate yet', () => {
++    const summary = summarizeStorageIops({
++      totalIops: null,
++      readIops: null,
++      writeIops: null,
++      readMiBs: null,
++      writeMiBs: null,
++      devices: [],
++      source: 'unavailable (needs two samples)',
++    });
++    expect(summary.totalIops).toBeNull();
++    expect(summary.devices).toEqual([]);
++  });
++});
++
++describe('storageIopsTotals', () => {
++  it('emits IOPS totals for hardware dashboards next to CPU/RAM', () => {
++    const totals = storageIopsTotals({
++      totalIops: 150.4,
++      readIops: 100,
++      writeIops: 50.4,
++      readMiBs: 1.2,
++      writeMiBs: 0.4,
++      devices: [],
++      source: '/proc/diskstats',
++    });
++    expect(totals).toEqual([
++      { label: 'IOPS', value: '150' },
++      { label: 'Read IOPS', value: '100' },
++      { label: 'Write IOPS', value: '50' },
++    ]);
++  });
++
++  it('renders dashes when storage IOPS has not been measured', () => {
++    const totals = storageIopsTotals(undefined);
++    expect(totals.map((row) => row.value)).toEqual(['—', '—', '—']);
++  });
++});
++
++describe('storageIopsTickerCells', () => {
++  it('splits measured read/write IOPS for the environment ticker', () => {
++    const cells = storageIopsTickerCells({
++      totalIops: 150,
++      readIops: 100,
++      writeIops: 50,
++      readMiBs: 1.2,
++      writeMiBs: 0.4,
++      devices: [],
++      source: '/proc/diskstats',
++    });
++    expect(cells.map((cell) => cell.label)).toEqual(['Read IOPS', 'Write IOPS']);
++    expect(cells.map((cell) => cell.value)).toEqual(['100', '50']);
++    expect(cells[0].sub).toBe('/proc/diskstats');
++  });
++
++  it('renders dashes while waiting for the second diskstats sample', () => {
++    const cells = storageIopsTickerCells(undefined);
++    expect(cells.map((cell) => cell.value)).toEqual(['—', '—']);
++  });
++});
++
++describe('payloadToEnvironmentSnapshot · storage IOPS', () => {
++  it('folds per-disk IOPS onto the same snapshot as CPU and DRAM', () => {
++    const snap = payloadToEnvironmentSnapshot(
++      payload({
++        storageIops: {
++          totalIops: 150,
++          readIops: 100,
++          writeIops: 50,
++          readMiBs: 1.2,
++          writeMiBs: 0.4,
++          devices: [{ device: 'sda', iops: 150, readIops: 100, writeIops: 50, readMiBs: 1.2, writeMiBs: 0.4 }],
++          source: '/proc/diskstats',
++        },
++      }),
++    );
++    expect(snap.storageIops?.totalIops).toBe(150);
++    expect(snap.storageIops?.devices[0].device).toBe('sda');
++    expect(snap.cpuPercent).toBe(10);
++  });
++
++  it('does not present a coerced 0 as measured cluster IOPS', () => {
++    const snap = payloadToEnvironmentSnapshot(payload({ totalIops: null }));
++    expect(formatMetric(snap, 'totalIops', (v) => String(v))).toBe('—');
++  });
++});
++
+diff --git a/src/lib/telemetry/storageIops.ts b/src/lib/telemetry/storageIops.ts
+new file mode 100644
+index 00000000..da451463
+--- /dev/null
++++ b/src/lib/telemetry/storageIops.ts
+@@ -0,0 +1,118 @@
++import type { MaybeMetric } from './types';
++
++export interface StorageDiskIops {
++  device: string;
++  iops: number;
++  readIops: number;
++  writeIops: number;
++  readMiBs: number | null;
++  writeMiBs: number | null;
++}
++
++export interface EnvironmentStorageIops {
++  totalIops: MaybeMetric;
++  readIops: MaybeMetric;
++  writeIops: MaybeMetric;
++  readMiBs: MaybeMetric;
++  writeMiBs: MaybeMetric;
++  devices: StorageDiskIops[];
++  source?: string;
++}
++
++export interface StorageIopsTotal {
++  label: string;
++  value: string;
++}
++
++function fmt(value: MaybeMetric | undefined): string {
++  if (value == null || Number.isNaN(value)) return '—';
++  return String(Math.round(value));
++}
++
++export function summarizeStorageIops(
++  input: EnvironmentStorageIops,
++): EnvironmentStorageIops {
++  return {
++    totalIops: input.totalIops ?? null,
++    readIops: input.readIops ?? null,
++    writeIops: input.writeIops ?? null,
++    readMiBs: input.readMiBs ?? null,
++    writeMiBs: input.writeMiBs ?? null,
++    devices: input.devices ?? [],
++    source: input.source,
++  };
++}
++
++export function emptyStorageIops(): EnvironmentStorageIops {
++  return {
++    totalIops: null,
++    readIops: null,
++    writeIops: null,
++    readMiBs: null,
++    writeMiBs: null,
++    devices: [],
++    source: 'unavailable',
++  };
++}
++
++export function demoStorageIops(): EnvironmentStorageIops {
++  return summarizeStorageIops({
++    totalIops: 1_120_000,
++    readIops: 640_000,
++    writeIops: 480_000,
++    readMiBs: 4820,
++    writeMiBs: 3920,
++    devices: [
++      { device: 'nvme0n1', iops: 700_000, readIops: 400_000, writeIops: 300_000, readMiBs: 3010, writeMiBs: 2440 },
++      { device: 'nvme1n1', iops: 420_000, readIops: 240_000, writeIops: 180_000, readMiBs: 1810, writeMiBs: 1480 },
++    ],
++    source: 'demo',
++  });
++}
++
++export function formatDiskMetric(value: MaybeMetric | undefined, digits = 0): string {
++  if (value == null || Number.isNaN(value)) return '—';
++  return digits > 0 ? value.toFixed(digits) : String(Math.round(value));
++}
++
++export function storageIopsTotals(
++  summary: EnvironmentStorageIops | undefined,
++): StorageIopsTotal[] {
++  return [
++    { label: 'IOPS', value: fmt(summary?.totalIops) },
++    { label: 'Read IOPS', value: fmt(summary?.readIops) },
++    { label: 'Write IOPS', value: fmt(summary?.writeIops) },
++  ];
++}
++
++export interface StorageTickerCell {
++  key: 'storageReadIops' | 'storageWriteIops';
++  label: string;
++  value: string;
++  sub: string;
++  delta?: number;
++}
++
++export function storageIopsTickerCells(
++  summary: EnvironmentStorageIops | undefined,
++): StorageTickerCell[] {
++  const source = summary?.source?.includes('diskstats')
++    ? '/proc/diskstats'
++    : summary?.totalIops == null
++      ? 'waiting for sample'
++      : summary?.source || 'physical disks';
++  return [
++    {
++      key: 'storageReadIops',
++      label: 'Read IOPS',
++      value: fmt(summary?.readIops),
++      sub: source,
++    },
++    {
++      key: 'storageWriteIops',
++      label: 'Write IOPS',
++      value: fmt(summary?.writeIops),
++      sub: 'completed writes / s',
++    },
++  ];
++}
+diff --git a/src/lib/telemetry/types.ts b/src/lib/telemetry/types.ts
+index f587119c..1182e6b8 100644
+--- a/src/lib/telemetry/types.ts
++++ b/src/lib/telemetry/types.ts
+@@ -1,4 +1,5 @@
+ import type { EnvironmentAcceleratorSummary } from './hardwareAddOn';
++import type { EnvironmentStorageIops } from './storageIops';
+ 
+ /**
+  * A metric the node could not measure. The BFF sends `null` rather than a
+@@ -30,6 +31,8 @@ export interface EnvironmentTelemetryPayload {
+   metricSources?: Record<string, string>;
+   /** Allowlisted FPGA / GPU / NPU / TPU pulse collected on the same tick as CPU / RAM. */
+   accelerators?: EnvironmentAcceleratorSummary;
++  /** Per-disk IOPS / throughput from /proc/diskstats on the same tick as CPU / RAM. */
++  storageIops?: EnvironmentStorageIops;
+ }
+ 
+ export interface LiveHealthPayload {
+diff --git a/src/styles.css b/src/styles.css
+index 5dcd8039..80a2db15 100644
+--- a/src/styles.css
++++ b/src/styles.css
+@@ -4828,6 +4828,20 @@ select {
+   background: color-mix(in srgb, var(--theme-panel) 70%, transparent);
+ }
+ 
++.storage-iops-panel {
++  margin-top: 0.55rem;
++}
++.holo-tile .storage-iops-panel {
++  margin: 0;
++  border: none;
++  background: transparent;
++  box-shadow: none;
++  padding: 0;
++}
++.storage-iops-list small {
++  font-variant-numeric: tabular-nums;
++}
++
+ .spdk-lanes { list-style: none; padding: 0; margin: 0; display: grid; gap: 0.5rem; }
+ .spdk-lanes li {
+   border: 1px solid var(--theme-panel-border);
+-- 
+2.43.0
+
