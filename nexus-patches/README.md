@@ -17,7 +17,7 @@ git checkout -b cursor/nexus-production-hardening main
 
 # Copy the patch files from this repo, then:
 git am 000*.patch
-# 0010 and 0011 are included in that glob (eleven patches total).
+# 0010–0012 are included in that glob (twelve patches total).
 
 npm install
 npx tsc --noEmit     # clean
@@ -216,6 +216,23 @@ hints). That crosses the 5–10 feature bar for a 3.0 release.
   (reads `/etc/nexus/version` when present)
 - README **Nexus 3.0 release** section; 2.0 kept as the historical baseline
 
+### 0012 — `docs`: allowlist NPU, TPU, and FPGA add-in cards
+
+Research note (no host agent yet). How Nexus can use a plugged-in card on
+first boot without supporting every vendor:
+
+- **FPGA:** AMD Alveo (XRT U-series plugin; V80 is VFIO/AVED, not XRT) and
+  Intel DFL/PAC (`fpga.intel.com`).
+- **NPU:** Intel Gaudi 3 PCIe (`1da3:1063`, `habana.ai/gaudi`) and Qualcomm
+  Cloud AI 100 (`17cb:a100`, in-tree `qaic`). Intel Core Ultra NPU is on-die,
+  not an add-in card.
+- **TPU:** Google Coral Edge TPU (`1ac1:089a`) only. Cloud TPU is not a PCIe
+  card you install.
+- Default consumption: Harvester `pcidevices-controller` VFIO (Mode A).
+  Vendor device plugins are opt-in (Mode B). Same PCI ID cannot be both.
+
+See `docs/accelerators.md` after applying the patch.
+
 ## Still outstanding
 
 Not addressed by these patches:
@@ -226,6 +243,9 @@ Not addressed by these patches:
   node with `/dev/kvm` and the KubeVirt operator.
 - **`lvcreate` for AnyRAID** is still unverified on kernels without
   device-mapper (see 0005).
+- **NPU/TPU/FPGA host agent** is design-only in 0012. The Acceleration
+  dashboard still uses catalog placeholders until an agent claims
+  allowlisted PCI IDs.
 
 ## Reproducing the live-cluster verification
 
