@@ -1,0 +1,653 @@
+From 1c1f42ea0da89fe4787340b3dacc5733a3eca4c0 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 18 Aug 2026 19:11:02 +0000
+Subject: [PATCH 1/6] fix(security): require authentication on all cockpit API
+ routes
+
+The cockpit BFF served every /api/v1 route without any authentication while
+binding 0.0.0.0. POST /api/v1/resources/apply pipes its body into
+kubectl apply using the node kubeconfig, which runs as system:admin in
+system:masters, so any host with network reach to a Nexus node could apply
+arbitrary manifests and take over the cluster. POST /api/v1/networking/ovs
+could likewise rewrite the node's network fabric.
+
+- Add cockpit_auth.py: PBKDF2-HMAC-SHA256 (600k iterations) credential
+  store, in-memory bearer sessions with TTL, and per-user lockout after
+  10 failures in 5 minutes.
+- Gate every /api/v1 route behind a valid session except auth/login and
+  auth/session; refuse to start if the credential store cannot init.
+- Generate a random initial password instead of shipping admin/admin, and
+  flag it for rotation. Add POST /api/v1/auth/password, which revokes all
+  sessions so a leaked token cannot outlive a credential change.
+- Redirect the plaintext port to HTTPS when certs exist so session tokens
+  do not travel in the clear; require TLS 1.2+.
+- Set HttpOnly/SameSite=Strict cookies, Secure under TLS.
+---
+ .../overlay/usr/lib/nexus/cockpit_auth.py     | 206 +++++++++++++
+ .../overlay/usr/lib/nexus/serve-cockpit.py    | 290 ++++++++++++++++--
+ 2 files changed, 477 insertions(+), 19 deletions(-)
+ create mode 100644 installer/overlay/usr/lib/nexus/cockpit_auth.py
+
+diff --git a/installer/overlay/usr/lib/nexus/cockpit_auth.py b/installer/overlay/usr/lib/nexus/cockpit_auth.py
+new file mode 100644
+index 000000000..b094dedf3
+--- /dev/null
++++ b/installer/overlay/usr/lib/nexus/cockpit_auth.py
+@@ -0,0 +1,206 @@
++#!/usr/bin/env python3
++"""Server-side authentication for the Nexus cockpit BFF.
++
++Credentials live in ``/etc/nexus/cockpit-auth.json`` as a PBKDF2-HMAC-SHA256
++digest. ``nexus-postinstall`` seeds the file on first boot; if it is missing
++when the cockpit starts, :func:`ensure_credential_store` generates a random
++password and writes it to ``/etc/nexus/cockpit-password`` (mode 0600) so an
++operator with node access can read it once and rotate it.
++
++Sessions are bearer tokens held in memory only. A cockpit restart invalidates
++every session, which is the behaviour we want on a single-node appliance: no
++session survives a reboot, and there is no persisted token to steal.
++"""
++
++from __future__ import annotations
++
++import base64
++import hashlib
++import hmac
++import json
++import os
++import secrets
++import threading
++import time
++from typing import Any
++
++AUTH_FILE = os.environ.get("NEXUS_COCKPIT_AUTH_FILE", "/etc/nexus/cockpit-auth.json")
++PASSWORD_HANDOFF_FILE = os.environ.get(
++    "NEXUS_COCKPIT_PASSWORD_FILE", "/etc/nexus/cockpit-password"
++)
++
++PBKDF2_ITERATIONS = 600_000
++SALT_BYTES = 16
++SESSION_TTL_SECONDS = int(os.environ.get("NEXUS_COCKPIT_SESSION_TTL", "43200"))
++MAX_FAILED_ATTEMPTS = 10
++LOCKOUT_SECONDS = 300
++
++
++def hash_password(password: str, salt: bytes | None = None, iterations: int = PBKDF2_ITERATIONS) -> dict[str, Any]:
++    if salt is None:
++        salt = secrets.token_bytes(SALT_BYTES)
++    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
++    return {
++        "algorithm": "pbkdf2-sha256",
++        "iterations": iterations,
++        "salt": base64.b64encode(salt).decode("ascii"),
++        "hash": base64.b64encode(digest).decode("ascii"),
++    }
++
++
++def verify_password(password: str, record: dict[str, Any]) -> bool:
++    """Constant-time password check against a stored credential record."""
++    try:
++        salt = base64.b64decode(record["salt"])
++        expected = base64.b64decode(record["hash"])
++        iterations = int(record.get("iterations", PBKDF2_ITERATIONS))
++    except (KeyError, ValueError, TypeError):
++        return False
++    candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
++    return hmac.compare_digest(candidate, expected)
++
++
++class CredentialStore:
++    """admin credentials plus the must-rotate flag, persisted as JSON."""
++
++    def __init__(self, path: str = AUTH_FILE):
++        self.path = path
++        self._lock = threading.Lock()
++
++    def load(self) -> dict[str, Any] | None:
++        try:
++            with open(self.path, "r", encoding="utf-8") as fh:
++                data = json.load(fh)
++        except (OSError, json.JSONDecodeError):
++            return None
++        return data if isinstance(data, dict) else None
++
++    def save(self, data: dict[str, Any]) -> None:
++        with self._lock:
++            directory = os.path.dirname(self.path)
++            if directory:
++                os.makedirs(directory, mode=0o700, exist_ok=True)
++            tmp = self.path + ".tmp"
++            with open(tmp, "w", encoding="utf-8") as fh:
++                json.dump(data, fh, indent=2)
++            os.chmod(tmp, 0o600)
++            os.replace(tmp, self.path)
++
++    def set_password(self, username: str, password: str, must_change: bool = False) -> dict[str, Any]:
++        record = {
++            "username": username,
++            "credential": hash_password(password),
++            "mustChangePassword": must_change,
++            "updatedAtMs": int(time.time() * 1000),
++        }
++        self.save(record)
++        return record
++
++
++def ensure_credential_store(store: CredentialStore | None = None) -> tuple[dict[str, Any], str | None]:
++    """Return the credential record, generating a random password if absent.
++
++    The second tuple element is the generated plaintext password when one was
++    created (so the caller can hand it to the operator), otherwise ``None``.
++    Never returns a hardcoded default — an appliance that ships a known
++    password is indistinguishable from one with no password at all.
++    """
++    store = store or CredentialStore()
++    existing = store.load()
++    if existing and isinstance(existing.get("credential"), dict):
++        return existing, None
++
++    password = secrets.token_urlsafe(18)
++    record = store.set_password("admin", password, must_change=True)
++    try:
++        directory = os.path.dirname(PASSWORD_HANDOFF_FILE)
++        if directory:
++            os.makedirs(directory, mode=0o700, exist_ok=True)
++        with open(PASSWORD_HANDOFF_FILE, "w", encoding="utf-8") as fh:
++            fh.write(password + "\n")
++        os.chmod(PASSWORD_HANDOFF_FILE, 0o600)
++    except OSError:
++        # Handing the password back to the caller still lets the operator see
++        # it in the cockpit journal, so a read-only /etc is not fatal.
++        pass
++    return record, password
++
++
++class SessionManager:
++    """In-memory bearer tokens with TTL, plus per-username lockout."""
++
++    def __init__(self, ttl_seconds: int = SESSION_TTL_SECONDS):
++        self.ttl = ttl_seconds
++        self._sessions: dict[str, dict[str, Any]] = {}
++        self._failures: dict[str, list[float]] = {}
++        self._lock = threading.Lock()
++
++    def _prune(self, now: float) -> None:
++        expired = [token for token, meta in self._sessions.items() if meta["expiresAt"] <= now]
++        for token in expired:
++            self._sessions.pop(token, None)
++
++    def create(self, username: str) -> dict[str, Any]:
++        now = time.time()
++        token = secrets.token_urlsafe(32)
++        with self._lock:
++            self._prune(now)
++            self._sessions[token] = {"username": username, "expiresAt": now + self.ttl}
++        return {"token": token, "expiresInSeconds": self.ttl}
++
++    def validate(self, token: str | None) -> str | None:
++        """Return the username for a live token, else None."""
++        if not token:
++            return None
++        now = time.time()
++        with self._lock:
++            self._prune(now)
++            meta = self._sessions.get(token)
++            if not meta:
++                return None
++            return str(meta["username"])
++
++    def revoke(self, token: str | None) -> None:
++        if not token:
++            return
++        with self._lock:
++            self._sessions.pop(token, None)
++
++    def revoke_all(self) -> None:
++        with self._lock:
++            self._sessions.clear()
++
++    def locked_out(self, username: str) -> bool:
++        now = time.time()
++        with self._lock:
++            attempts = [t for t in self._failures.get(username, []) if now - t < LOCKOUT_SECONDS]
++            self._failures[username] = attempts
++            return len(attempts) >= MAX_FAILED_ATTEMPTS
++
++    def record_failure(self, username: str) -> None:
++        now = time.time()
++        with self._lock:
++            self._failures.setdefault(username, []).append(now)
++
++    def clear_failures(self, username: str) -> None:
++        with self._lock:
++            self._failures.pop(username, None)
++
++
++def parse_bearer_token(header_value: str | None) -> str | None:
++    if not header_value:
++        return None
++    parts = header_value.split(None, 1)
++    if len(parts) != 2 or parts[0].lower() != "bearer":
++        return None
++    return parts[1].strip() or None
++
++
++def parse_session_cookie(cookie_header: str | None, name: str = "nexus_session") -> str | None:
++    if not cookie_header:
++        return None
++    for chunk in cookie_header.split(";"):
++        key, _, value = chunk.strip().partition("=")
++        if key == name:
++            return value.strip() or None
++    return None
+diff --git a/installer/overlay/usr/lib/nexus/serve-cockpit.py b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+index 0d98c4cb1..5e3f5ef52 100644
+--- a/installer/overlay/usr/lib/nexus/serve-cockpit.py
++++ b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+@@ -3,6 +3,7 @@
+ 
+ from __future__ import annotations
+ 
++import hmac
+ import http.server
+ import importlib.util
+ import json
+@@ -15,6 +16,7 @@ from typing import Callable
+ from urllib.parse import urlparse
+ 
+ ROOT = os.environ.get("NEXUS_COCKPIT_ROOT", "/usr/share/nexus-cockpit/dist")
++BIND_ADDRESS = os.environ.get("NEXUS_COCKPIT_BIND", "0.0.0.0")
+ HTTP_PORT = int(os.environ.get("NEXUS_COCKPIT_HTTP_PORT", "8080"))
+ HTTPS_PORT = int(os.environ.get("NEXUS_COCKPIT_HTTPS_PORT", "8443"))
+ TLS_CRT = os.environ.get("NEXUS_COCKPIT_TLS_CRT", "/etc/nexus/tls/cockpit.crt")
+@@ -23,6 +25,11 @@ METRICS_MODULE = os.path.join(os.path.dirname(__file__), "cluster_metrics.py")
+ DASHBOARDS_MODULE = os.path.join(os.path.dirname(__file__), "dashboard_collectors.py")
+ RESOURCES_MODULE = os.path.join(os.path.dirname(__file__), "cluster_resources.py")
+ OVS_MODULE = os.path.join(os.path.dirname(__file__), "ovs_operations.py")
++AUTH_MODULE = os.path.join(os.path.dirname(__file__), "cockpit_auth.py")
++
++# Endpoints reachable without a session. Everything else under /api/v1
++# requires a valid bearer token or session cookie.
++PUBLIC_PATHS = frozenset({"/healthz", "/api/v1/auth/login", "/api/v1/auth/session"})
+ 
+ 
+ def _load_module(path: str, name: str):
+@@ -50,14 +57,64 @@ def _load_ovs():
+     return _load_module(OVS_MODULE, "nexus_ovs_operations")
+ 
+ 
++def _load_auth():
++    return _load_module(AUTH_MODULE, "nexus_cockpit_auth")
++
++
+ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+-    def __init__(self, *args, metrics=None, dashboards=None, resources=None, ovs=None, **kwargs):
++    def __init__(
++        self,
++        *args,
++        metrics=None,
++        dashboards=None,
++        resources=None,
++        ovs=None,
++        auth=None,
++        credentials=None,
++        sessions=None,
++        tls_enabled=False,
++        **kwargs,
++    ):
+         self._metrics = metrics
+         self._dashboards = dashboards
+         self._resources = resources
+         self._ovs = ovs
++        self._auth = auth
++        self._credentials = credentials
++        self._sessions = sessions
++        self._tls_enabled = tls_enabled
++        self._pending_cookie = None
++        self._clear_cookie = False
+         super().__init__(*args, directory=ROOT, **kwargs)
+ 
++    # ---------------- authentication ----------------
++
++    def _session_token(self) -> str | None:
++        if self._auth is None:
++            return None
++        token = self._auth.parse_bearer_token(self.headers.get("Authorization"))
++        if token:
++            return token
++        return self._auth.parse_session_cookie(self.headers.get("Cookie"))
++
++    def _authenticated_user(self) -> str | None:
++        if self._sessions is None:
++            return None
++        return self._sessions.validate(self._session_token())
++
++    def _require_auth(self) -> bool:
++        """Send 401 and return False when the caller has no valid session."""
++        if self._authenticated_user() is not None:
++            return True
++        body = json.dumps({"error": "authentication required"}).encode("utf-8")
++        self.send_response(401)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Cache-Control", "no-store")
++        self.send_header("WWW-Authenticate", 'Bearer realm="nexus-cockpit"')
++        self.end_headers()
++        self.wfile.write(body)
++        return False
++
+     def do_GET(self):
+         parsed = urlparse(self.path)
+         path = parsed.path.rstrip("/") or "/"
+@@ -66,6 +123,14 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             self._plain(200, b"ok")
+             return
+ 
++        if path == "/api/v1/auth/session":
++            self._json_api(self._handle_session_info)
++            return
++
++        if path.startswith("/api/v1/"):
++            if path not in PUBLIC_PATHS and not self._require_auth():
++                return
++
+         if path == "/api/v1/health/live":
+             self._json_api(self._handle_live_health)
+             return
+@@ -78,6 +143,10 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             self._json_api(self._handle_dashboards)
+             return
+ 
++        if path.startswith("/api/v1/"):
++            self._plain(404, b"not found")
++            return
++
+         requested = self.translate_path(self.path)
+         if not os.path.exists(requested) or os.path.isdir(requested):
+             self.path = "/index.html"
+@@ -87,6 +156,22 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+         parsed = urlparse(self.path)
+         path = parsed.path.rstrip("/") or "/"
+ 
++        if path == "/api/v1/auth/login":
++            self._json_api(self._handle_login)
++            return
++
++        if path == "/api/v1/auth/logout":
++            self._json_api(self._handle_logout)
++            return
++
++        if path.startswith("/api/v1/") and path not in PUBLIC_PATHS:
++            if not self._require_auth():
++                return
++
++        if path == "/api/v1/auth/password":
++            self._json_api(self._handle_change_password)
++            return
++
+         if path == "/api/v1/resources/apply":
+             self._json_api(self._handle_apply_manifest)
+             return
+@@ -101,22 +186,131 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+ 
+         self._plain(404, b"not found")
+ 
+-    def _plain(self, code: int, body: bytes, content_type: str = "text/plain") -> None:
++    def _plain(
++        self,
++        code: int,
++        body: bytes,
++        content_type: str = "text/plain",
++        extra_headers: list[tuple[str, str]] | None = None,
++    ) -> None:
+         self.send_response(code)
+         self.send_header("Content-Type", content_type)
+         self.send_header("Cache-Control", "no-store")
++        for name, value in extra_headers or []:
++            self.send_header(name, value)
+         self.end_headers()
+         self.wfile.write(body)
+ 
++    def _session_cookie_headers(self) -> list[tuple[str, str]]:
++        """Emit Set-Cookie for a login/logout that just happened."""
++        secure = "; Secure" if self._tls_enabled else ""
++        token = getattr(self, "_pending_cookie", None)
++        if token:
++            self._pending_cookie = None
++            return [
++                (
++                    "Set-Cookie",
++                    "nexus_session=%s; Path=/; HttpOnly; SameSite=Strict%s" % (token, secure),
++                )
++            ]
++        if getattr(self, "_clear_cookie", False):
++            self._clear_cookie = False
++            return [
++                (
++                    "Set-Cookie",
++                    "nexus_session=; Path=/; HttpOnly; SameSite=Strict%s; Max-Age=0" % secure,
++                )
++            ]
++        return []
++
+     def _json_api(self, handler: Callable[[], dict]) -> None:
+         try:
+             payload = handler()
+             body = json.dumps(payload).encode("utf-8")
+-            self._plain(200, body, "application/json")
++            self._plain(200, body, "application/json", self._session_cookie_headers())
++        except ValueError as exc:
++            body = json.dumps({"success": False, "error": str(exc)}).encode("utf-8")
++            self._plain(400, body, "application/json")
+         except Exception as exc:  # noqa: BLE001
+             body = json.dumps({"error": str(exc)}).encode("utf-8")
+             self._plain(503, body, "application/json")
+ 
++    def _handle_session_info(self) -> dict:
++        """Unauthenticated: lets the SPA discover whether a backend is present."""
++        record = self._credentials.load() if self._credentials else None
++        user = self._authenticated_user()
++        return {
++            "backend": True,
++            "authenticated": user is not None,
++            "username": user,
++            "mustChangePassword": bool((record or {}).get("mustChangePassword")),
++        }
++
++    def _handle_login(self) -> dict:
++        if self._auth is None or self._credentials is None or self._sessions is None:
++            return {"success": False, "error": "authentication unavailable"}
++        body = self._read_json_body()
++        username = str(body.get("username") or "").strip()
++        password = str(body.get("password") or "")
++        if not username or not password:
++            return {"success": False, "error": "username and password required"}
++
++        if self._sessions.locked_out(username):
++            return {"success": False, "error": "too many failed attempts; try again later"}
++
++        record = self._credentials.load()
++        if not record or not isinstance(record.get("credential"), dict):
++            return {"success": False, "error": "no credentials provisioned on this node"}
++
++        expected_user = str(record.get("username") or "admin")
++        # Compare both factors before returning so a wrong username and a wrong
++        # password cost the same amount of work.
++        user_ok = hmac.compare_digest(username, expected_user)
++        password_ok = self._auth.verify_password(password, record["credential"])
++        if not (user_ok and password_ok):
++            self._sessions.record_failure(username)
++            return {"success": False, "error": "invalid credentials"}
++
++        self._sessions.clear_failures(username)
++        session = self._sessions.create(expected_user)
++        self._pending_cookie = session["token"]
++        return {
++            "success": True,
++            "error": None,
++            "username": expected_user,
++            "token": session["token"],
++            "expiresInSeconds": session["expiresInSeconds"],
++            "mustChangePassword": bool(record.get("mustChangePassword")),
++        }
++
++    def _handle_logout(self) -> dict:
++        if self._sessions is not None:
++            self._sessions.revoke(self._session_token())
++        self._clear_cookie = True
++        return {"success": True, "error": None}
++
++    def _handle_change_password(self) -> dict:
++        if self._auth is None or self._credentials is None or self._sessions is None:
++            return {"success": False, "error": "authentication unavailable"}
++        body = self._read_json_body()
++        current = str(body.get("currentPassword") or "")
++        new = str(body.get("newPassword") or "")
++        if len(new) < 12:
++            return {"success": False, "error": "new password must be at least 12 characters"}
++
++        record = self._credentials.load() or {}
++        credential = record.get("credential")
++        if not isinstance(credential, dict) or not self._auth.verify_password(current, credential):
++            return {"success": False, "error": "current password is incorrect"}
++
++        username = str(record.get("username") or "admin")
++        self._credentials.set_password(username, new, must_change=False)
++        # Rotating the password invalidates every existing session, including
++        # this one, so a leaked token cannot outlive the credential change.
++        self._sessions.revoke_all()
++        self._clear_cookie = True
++        return {"success": True, "error": None, "reauthenticationRequired": True}
++
+     def _handle_live_health(self) -> dict:
+         if self._metrics is None:
+             return {
+@@ -177,23 +371,49 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+         sys.stderr.write("[nexus-cockpit] %s - %s\n" % (self.address_string(), fmt % args))
+ 
+ 
+-def bind_server(port: int, metrics, dashboards, resources, ovs) -> socketserver.TCPServer:
+-    class ReuseTCPServer(socketserver.TCPServer):
+-        allow_reuse_address = True
++class ReuseThreadingTCPServer(socketserver.ThreadingTCPServer):
++    allow_reuse_address = True
++    daemon_threads = True
++
++
++class HttpsRedirectHandler(http.server.BaseHTTPRequestHandler):
++    """Plaintext listener used only to bounce callers to HTTPS.
++
++    Serving the API over plaintext alongside TLS would let a session token
++    travel in the clear, so when certificates are present the HTTP port
++    redirects instead of handling requests.
++    """
++
++    def _redirect(self) -> None:
++        host = (self.headers.get("Host") or "").split(":")[0] or "localhost"
++        target = "https://%s:%d%s" % (host, HTTPS_PORT, self.path)
++        self.send_response(308)
++        self.send_header("Location", target)
++        self.send_header("Cache-Control", "no-store")
++        self.end_headers()
++
++    do_GET = _redirect
++    do_POST = _redirect
++    do_HEAD = _redirect
+ 
++    def log_message(self, fmt, *args):
++        return
++
++
++def bind_server(port: int, services: dict, tls_enabled: bool) -> socketserver.TCPServer:
+     def handler(*args, **kwargs):
+-        SPAHandler(*args, metrics=metrics, dashboards=dashboards, resources=resources, ovs=ovs, **kwargs)
++        SPAHandler(*args, tls_enabled=tls_enabled, **services, **kwargs)
+ 
+     try:
+-        return ReuseTCPServer(("0.0.0.0", port), handler)
++        return ReuseThreadingTCPServer((BIND_ADDRESS, port), handler)
+     except OSError as exc:
+-        sys.stderr.write("nexus-cockpit: bind 0.0.0.0:%d failed: %s\n" % (port, exc))
++        sys.stderr.write("nexus-cockpit: bind %s:%d failed: %s\n" % (BIND_ADDRESS, port, exc))
+         raise
+ 
+ 
+-def serve_http_background(metrics, dashboards, resources, ovs) -> None:
++def serve_redirect_background() -> None:
+     try:
+-        with bind_server(HTTP_PORT, metrics, dashboards, resources, ovs) as httpd:
++        with ReuseThreadingTCPServer((BIND_ADDRESS, HTTP_PORT), HttpsRedirectHandler) as httpd:
+             httpd.serve_forever()
+     except OSError:
+         sys.stderr.write("nexus-cockpit: HTTP listener on %d unavailable\n" % HTTP_PORT)
+@@ -228,28 +448,60 @@ def main() -> int:
+         sys.stderr.write("nexus-cockpit: OVS module disabled: %s\n" % exc)
+         ovs = None
+ 
++    # Authentication is mandatory: every /api/v1 route other than login and
++    # session discovery mutates or exposes cluster state, so the cockpit
++    # refuses to serve at all if the credential store cannot be initialised.
++    try:
++        auth = _load_auth()
++        credentials = auth.CredentialStore()
++        record, generated = auth.ensure_credential_store(credentials)
++        sessions = auth.SessionManager()
++    except Exception as exc:  # noqa: BLE001
++        sys.stderr.write("nexus-cockpit: FATAL: authentication unavailable: %s\n" % exc)
++        return 1
++
++    if generated:
++        sys.stderr.write(
++            "nexus-cockpit: generated initial admin password (also written to %s):\n"
++            "nexus-cockpit:   %s\n"
++            "nexus-cockpit: change it on first login.\n" % (auth.PASSWORD_HANDOFF_FILE, generated)
++        )
++    elif record.get("mustChangePassword"):
++        sys.stderr.write("nexus-cockpit: admin password is flagged for rotation on next login\n")
++
++    services = {
++        "metrics": metrics,
++        "dashboards": dashboards,
++        "resources": resources,
++        "ovs": ovs,
++        "auth": auth,
++        "credentials": credentials,
++        "sessions": sessions,
++    }
++
+     if os.path.isfile(TLS_CRT) and os.path.isfile(TLS_KEY):
+-        threading.Thread(
+-            target=serve_http_background, args=(metrics, dashboards, resources, ovs), daemon=True
+-        ).start()
++        threading.Thread(target=serve_redirect_background, daemon=True).start()
+         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+         ctx.load_cert_chain(certfile=TLS_CRT, keyfile=TLS_KEY)
+         try:
+-            with bind_server(HTTPS_PORT, metrics, dashboards, resources, ovs) as httpd:
++            with bind_server(HTTPS_PORT, services, tls_enabled=True) as httpd:
+                 httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+                 sys.stderr.write(
+-                    "nexus-cockpit listening on https://0.0.0.0:%d (http://0.0.0.0:%d)\n"
+-                    % (HTTPS_PORT, HTTP_PORT)
++                    "nexus-cockpit listening on https://%s:%d (http://%s:%d redirects)\n"
++                    % (BIND_ADDRESS, HTTPS_PORT, BIND_ADDRESS, HTTP_PORT)
+                 )
+                 httpd.serve_forever()
+         except OSError:
+             return 1
+     else:
+         sys.stderr.write(
+-            "nexus-cockpit listening on http://0.0.0.0:%d (no TLS certs)\n" % HTTP_PORT
++            "nexus-cockpit listening on http://%s:%d (no TLS certs — sessions are "
++            "unencrypted in transit; provision %s and %s)\n"
++            % (BIND_ADDRESS, HTTP_PORT, TLS_CRT, TLS_KEY)
+         )
+         try:
+-            with bind_server(HTTP_PORT, metrics, dashboards, resources, ovs) as httpd:
++            with bind_server(HTTP_PORT, services, tls_enabled=False) as httpd:
+                 httpd.serve_forever()
+         except OSError:
+             return 1
+-- 
+2.43.0
+

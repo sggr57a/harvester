@@ -1,0 +1,74 @@
+From b71eb185ce85f13e71332366570649f9c16a7282 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 18 Aug 2026 19:29:17 +0000
+Subject: [PATCH 6/6] docs: correct stale AGENTS.md claims
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+AGENTS.md stated 'There is no backend — all data is mock/computed locally',
+which is wrong: installer/overlay/usr/lib/nexus/ contains ~1700 lines of
+collectors that serve real cluster and host metrics on an installed node. It
+also listed three themes that no longer exist (Emerald Console, Solar Flare),
+claimed 41 tests, and documented admin/demo as the credentials.
+
+Describe the live/demo split, the null-versus-zero metric contract, and the
+real four themes. Test count is now 328 and there is no hardcoded default
+password on an installed node.
+---
+ AGENTS.md | 26 +++++++++++++++++++++++---
+ 1 file changed, 23 insertions(+), 3 deletions(-)
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 5b82b208e..fdde6fb01 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -4,7 +4,27 @@
+ 
+ ### Overview
+ 
+-Nexus is a React + TypeScript SPA (Vite) that serves as a front-end demo for a hyperconverged infrastructure (HCI) management platform. There is **no backend** — all data is mock/computed locally. Authentication uses hardcoded credentials: `admin` / `demo`.
++Nexus is a React + TypeScript SPA (Vite) for a hyperconverged infrastructure (HCI) management platform.
++
++It runs in one of two modes, resolved by `src/lib/telemetry/mode.ts`:
++
++- **live** — the SPA is served by the cockpit BFF on an installed node
++  (`installer/overlay/usr/lib/nexus/serve-cockpit.py`), which collects real
++  cluster and host metrics by shelling out to `kubectl` and reading kernel
++  counters. There *is* a backend; it just isn't part of the Vite dev server.
++- **demo** — no backend reachable, so dashboards render synthetic data. This is
++  the mode you get from `npm run dev`.
++
++Metrics the node cannot measure are returned as `null`, never as `0` or a
++placeholder, and are listed in `snapshot.unavailableMetrics` so the UI can show
++"unavailable" instead of a fabricated reading. Preserve that distinction when
++adding widgets.
++
++Authentication on an installed node is server-side (PBKDF2 + bearer sessions in
++`cockpit_auth.py`); the initial admin password is generated at first boot and
++written to `/etc/nexus/cockpit-password`. There is no hardcoded default. The
++standalone demo still accepts `admin` / `admin` locally via `src/lib/auth.ts`
++because it has no backend to authenticate against.
+ 
+ ### Commands
+ 
+@@ -13,14 +33,14 @@ Nexus is a React + TypeScript SPA (Vite) that serves as a front-end demo for a h
+ | Install deps | `npm install` |
+ | Dev server | `npm run dev` (serves on port **4173**) |
+ | Type check | `npx tsc --noEmit` |
+-| Unit tests | `npm run test` (Vitest, 41 tests) |
++| Unit tests | `npm run test` (Vitest, 328 tests) |
+ | Production build | `npm run build` |
+ 
+ ### Key notes
+ 
+ - The Vite dev server is configured to port **4173** (not the default 5173); see `vite.config.ts`.
+ - All dashboard styling lives in a single file: `src/styles.css`. Theme tokens use CSS custom properties (`--theme-*` and `--route-*`).
+-- Three themes are available (Route Grid, Emerald Console, Solar Flare) — switchable via the sidebar theme picker; persisted in `localStorage` as `nexus.theme`.
++- Four themes are available (Route Grid, Arctic Hologram, Arctic Command, Ice Spectrum) — switchable via the sidebar theme picker; persisted in `localStorage` as `nexus.theme`.
+ - The `platform/harvester/` directory contains Go source from the upstream Harvester project. It is **not built or run** as part of the frontend demo. Ignore it for frontend development.
+ - No ESLint/Prettier is configured; the only lint gate is `tsc --noEmit`.
+ - Playwright scripts under `scripts/` (smoke-shot, record-mockups) are optional and require `npx playwright install chromium` before first use.
+-- 
+2.43.0
+

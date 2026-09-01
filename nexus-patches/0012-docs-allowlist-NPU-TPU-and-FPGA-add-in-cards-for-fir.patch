@@ -1,0 +1,254 @@
+From 59597b435c9febbad3d2e86ea793a1ca55175976 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 15:54:01 +0000
+Subject: [PATCH] docs: allowlist NPU, TPU, and FPGA add-in cards for
+ first-boot use
+
+Record the vendor-limited path (Alveo, Intel DFL FPGA, Gaudi 3 PCIe,
+Qualcomm AI 100, Coral Edge TPU) and default VFIO via Harvester
+pcidevices-controller. Shared device plugins stay opt-in per vendor.
+---
+ AGENTS.md            |   1 +
+ README.md            |   2 +-
+ docs/accelerators.md | 207 +++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 209 insertions(+), 1 deletion(-)
+ create mode 100644 docs/accelerators.md
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 13357656..6f3d0019 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -48,3 +48,4 @@ because it has no backend to authenticate against.
+ - Live XDR events come from Falco / Tetragon / Suricata / Wazuh pod logs via `xdr_ingest.py`; Kubernetes Warning events keep a derived severity instead of a hardcoded `medium`.
+ - Live consoles attach through `console_proxy.py` (`/api/v1/console/{vnc,serial,exec}`) onto KubeVirt subresources or `kubectl exec`. `src/lib/demoConsole.ts` is demo-mode only.
+ - Memory tiering is host-side (`memory_tiering.py` + `nexus-memory-tiering.service`). Live Processor & Memory reads `/proc` and `/sys` (demotion, zswap, swap, PSI, NUMA). Do not fabricate tier capacity when the hardware is absent — list it under `waitingForHardware`.
++- NPU / TPU / FPGA add-in cards: allowlist and first-boot design in `docs/accelerators.md`. Do not claim live Coral / Alveo / Gaudi utilization until a host agent inventories PCI. Default consumption is Harvester `pcidevices-controller` VFIO, not a generic device plugin.
+diff --git a/README.md b/README.md
+index 40fd2db5..ee3a66de 100644
+--- a/README.md
++++ b/README.md
+@@ -30,7 +30,7 @@ Highlights:
+ 
+ - **Poly-Compute Engine** — runs KubeVirt VMs, Incus / LXC system containers, and native Kubernetes pods on the same bare-metal loop, with NUMA-local DRAM affinity, 1 GiB hugepages for KubeVirt, nested-virt opt-in pools, and cross-socket cost penalties on the scheduler.
+ - **Universal Storage Fabric** — every storage backend in the catalog is wired into CSI / direct-host paths, including **Vitastor** with SPDK userspace queues, NVMe-oF / RDMA with userspace bypass, ZFS with copy-on-write + zstd + ARC cache, **AnyRAID** with heterogeneous-capacity drive slabbing, iSCSI multipath via `vfio-pci`, and NFS / SMB through the subpath driver for RWX shares.
+-- **Hardware acceleration** — SPDK userspace NVMe-oF queues, DPDK polled-mode rings, vhost-user fast paths, NUMA pinning with 1 GiB hugepages, GPU / FPGA / smart-NIC / TPU pass-through (vfio-pci / SR-IOV / mdev), and L1 nested virtualization for training, inference, sandbox, and CI pools.
++- **Hardware acceleration** — SPDK userspace NVMe-oF queues, DPDK polled-mode rings, vhost-user fast paths, NUMA pinning with 1 GiB hugepages, GPU / FPGA / smart-NIC / TPU pass-through (vfio-pci / SR-IOV / mdev), and L1 nested virtualization for training, inference, sandbox, and CI pools. NPU / TPU / FPGA **add-in cards** are an allowlisted first-boot path (AMD Alveo, Intel DFL FPGA, Intel Gaudi 3 PCIe, Qualcomm Cloud AI 100, Google Coral Edge TPU) — see [`docs/accelerators.md`](./docs/accelerators.md). The Acceleration dashboard still uses catalog rows until that agent lands.
+ - **Memory tiering** — Linux NUMA demotion/promotion for CXL Type-3 and leftover Optane/PMem (DAX kmem), HBM when the kernel groups it as a faster node, zswap plus a bounded NVMe-backed swap file as the last safety net, DAMON/weighted-interleave/pghot/CXL-pooling hooks that activate when those sysfs trees appear. This is **not** vSphere NVMe-as-RAM; guests do not see extra DRAM. See [`docs/memory-tiering.md`](./docs/memory-tiering.md).
+ - **Machine Wizard 2.0** — install YAML with `poly_compute` and `hardware_acceleration` blocks plus boot-parameter switches (`nexus.poly_compute=kubevirt,incus,pods`, `nexus.acceleration.spdk=true`, `nexus.acceleration.hugepages_1g=64`, `nexus.acceleration.gpu_passthrough=true`). Validation refuses configs that turn off every runtime or enable GPU pass-through without NUMA pinning.
+ - **Built-in XDR / MDR platform (100% FOSS)** — every Nexus install ships with a complete detect-and-respond stack: 17 open-source sensors (Falco, Tetragon, Wazuh, Trivy, Grype, Syft, Suricata, Hubble, OpenSearch, MISP, kube-bench, kube-hunter, Polaris, OpenCanary, OpenSCAP, Lynis), 10 free threat-intel feeds (MISP, OTX, ThreatFox, URLhaus, Feodotracker, ETOpen, MITRE ATT&CK, NVD, OSV, internal allowlist), 18 Sigma-style detection rules covering all seven MITRE ATT&CK kill-chain phases, 10 automated response actions that emit real Kubernetes manifests (Cilium NetworkPolicy isolate, Harvester host cordon/drain, KubeVirt `VirtualMachineSnapshot`, Incus snapshot, Tetragon `TracingPolicy` SIGKILL, ArgoCD rollback, Trivy image block, Cilium CCNP egress-domain block), and APT geo-attribution that maps sources to actors like APT28 / LAZARUS. No paid SKUs, no subscriptions.
+diff --git a/docs/accelerators.md b/docs/accelerators.md
+new file mode 100644
+index 00000000..6b114284
+--- /dev/null
++++ b/docs/accelerators.md
+@@ -0,0 +1,207 @@
++# NPU, TPU, and FPGA add-in cards
++
++Nexus already *talks* about GPU / FPGA / smart-NIC / TPU pass-through
++(`capability.fpga-passthrough`, wizard “GPU / FPGA pass-through”, Acceleration
++dashboard). That path is **catalog + flags**. There is no host agent that
++discovers a card, binds a driver, or advertises it to KubeVirt or kubelet.
++
++This note is the allowlist and first-boot design so a plugged-in card can be
++used **without supporting every vendor**. Missing hardware stays
++`waitingForHardware`, same contract as memory tiering.
++
++## What “use it right away” means
++
++A PCIe add-in card is usable on a Nexus node in **exactly one** of two modes.
++The same function cannot be bound to `vfio-pci` *and* a vendor kmod at once.
++
++| Mode | Who runs inference | First-boot work | Live migration |
++|---|---|---|---|
++| **A — VFIO / VM** | Guest (KubeVirt or Incus) with the vendor’s guest driver | Enable Harvester `pcidevices-controller`, claim allowlisted BDFs, IOMMU on | No (device is pinned to the node) |
++| **B — host shared / pod** | Native pod via a Kubernetes device plugin + vendor runtime | Load kmod (in-tree or DKMS), deploy that vendor’s DaemonSet, advertise an extended resource | No |
++
++**Mode A is the default for “card in the slot, workloads tomorrow.”** Harvester
++already implements it for any PCI device: enable the
++[`pcidevices-controller` add-on](https://docs.harvesterhci.io/v1.4/advanced/addons/pcidevices),
++create a `PCIDeviceClaim`, and attach `hostDevices` on the VM. Nexus should
++auto-claim **only** the allowlisted vendor IDs below, then show them on the
++Acceleration dashboard from live `PCIDevice` objects instead of the demo
++Coral / Alveo U200 rows.
++
++Mode B is opt-in per vendor when the operator wants pods (not VMs) to share the
++card. Each vendor’s plugin is a separate DaemonSet; do not invent a generic NPU
++plugin.
++
++Firmware: IOMMU (VT-d / AMD-Vi) already in the Nexus platform table. Secure
++Boot off remains required for unsigned DKMS (Coral gasket, Hailo PCIe, some
++XRT).
++
++## Allowlist (leaders only)
++
++Do not add Tenstorrent, Groq, Graphcore, Huawei Ascend, Mythic, Lattice eval
++boards, or every Alveo SKU. Three classes, five vendors.
++
++### FPGA — AMD Alveo and Intel PAC / DFL
++
++**AMD (Xilinx) Alveo** is the production PCIe FPGA line after the 2022
++acquisition. Classic U-series cards (U55C, U250, U30) use **XRT** on the host
++and the [AMD-Xilinx Kubernetes device plugin](https://docs.amd.com/r/en-US/Xilinx_Kubernetes_Device_Plugin/Xilinx_Kubernetes_Device_Plugin)
++(`xilinx.com/fpga-…` or `amd.com/ama_u30` resources). There is still no
++supported cluster *operator*; the plugin is a DaemonSet.
++
++**Alveo V80** is the current high-end card (Versal HBM, PCIe Gen4 x16 or dual
++Gen5 x8). It does **not** use XRT. Host management is AVED / AMI; XRT and AMI
++must not run on the same host. For Nexus, V80 is **Mode A (VFIO)** unless the
++operator installs AVED by hand.
++
++PCI vendor: `10ee` (Xilinx). Discover with `lspci -nn -d 10ee:`.
++
++**Intel FPGA** (Arria 10, Stratix 10 PAC; DFL-class Agilex) uses the in-tree
++Linux **DFL** driver or out-of-tree OPAE, plus the
++[Intel FPGA device plugin](https://intel.github.io/intel-device-plugins-for-kubernetes/cmd/fpga_plugin/README.html)
++(`fpga.intel.com/…`). Modes: `af` (bitstream already on the card) or `region`
++(plugin programs the region before the container starts). Intel’s own plugin
++docs list Arria 10 and Stratix 10; treat newer DFL devices as “advertise if
++sysfs appears,” same as CXL hooks.
++
++PCI vendor: `8086` with DFL/OPAE class — **never** bind every Intel PCI
++function. Match DFL sysfs (`/sys/class/fpga_region`, `/dev/dfl-*`) rather than
++vendor ID alone.
++
++### NPU — Intel Gaudi 3 PCIe (datacenter) and Qualcomm Cloud AI 100
++
++**Intel Gaudi 3 PCIe (HL-338)** is the add-in NPU to ship first. Intel sells it
++as a standard PCIe Gen5 card (not only OAM). Kubernetes path is the
++[Gaudi Base Operator](https://docs.habana.ai/en/latest/Installation_Guide/Additional_Installation/Kubernetes_Installation/Kubernetes_Operator.html)
++or the [gaudi-device-plugin](https://github.com/HabanaAI/gaudi-device-plugin)
++DaemonSet. Pods request `habana.ai/gaudi`. Drivers: `habanalabs`,
++`habanalabs_cn`, `habanalabs_ib`, `habanalabs_en`.
++
++Intel also documents **VFIO into a VM** for Gaudi: isolate `1da3:` IDs, then
++install Habana software in the guest
++([Configuring VMs on Gaudi](https://docs.habana.ai/en/latest/Virtualization/Configuring_VMs_on_Gaudi.html)).
++
++| SKU | PCI ID |
++|---|---|
++| Gaudi 2 | `1da3:1020` |
++| Gaudi 3 OAM | `1da3:1060` |
++| Gaudi 3 PCIe (HL-338) | `1da3:1063` |
++
++**Do not confuse this with `npu.intel.com/accel`.** That Intel NPU plugin is
++for **on-die** Core Ultra (Meteor Lake / Arrow Lake / Lunar Lake / Panther
++Lake) NPUs, not an add-in card
++([npu_plugin README](https://intel.github.io/intel-device-plugins-for-kubernetes/cmd/npu_plugin/README.html)).
++Optional later for laptops/NUC nodes; out of scope for “add-on cards.”
++
++**Qualcomm Cloud AI 100** is the other widely deployed PCIe inference NPU.
++In-tree Linux driver is `qaic` (`CONFIG_DRM_ACCEL_QAIC`). All SKUs use PCI
++`17cb:a100`. Device nodes: `/dev/accel/accel*`. Kubernetes: QAic device plugin
++(`qualcomm.com/qaic` or `qaic-std` / `qaic-pro` / `qaic-ultra`). Platform SDK
++still required on the node for firmware
++([kernel AIC100 doc](https://docs.kernel.org/accel/qaic/aic100.html),
++[QAic K8s plugin](https://quic.github.io/cloud-ai-sdk-pages/latest/Getting-Started/Deployment/Kubernetes/index)).
++
++**Hailo-8 / Hailo-10** M.2 modules are popular at the edge (26 TOPS Hailo-8)
++but Kubernetes support is community plugins, not a first-party operator.
++Keep Hailo **waitingForHardware** unless an operator explicitly enables an
++experimental plugin. Do not ship unsigned Hailo DKMS on the ISO by default.
++
++### TPU — Google Coral Edge TPU only
++
++Google **Cloud TPU** (v5e, Trillium, Ironwood, …) is a Google-operated
++datacenter ASIC. It is **not** a PCIe card you install in a Harvester node
++([Coral FAQ](https://gweb-coral-full.uc.r.appspot.com/docs/edgetpu/faq/)).
++TPU v1 was a Google-internal PCIe card in 2015; that product is not sold.
++
++The only Google TPU you can plug into a Nexus box is **Coral Edge TPU**:
++
++- Mini PCIe accelerator
++- M.2 A+E, B+M, dual Edge TPU
++- ASUS AI Accelerator PCIe card that holds up to eight Coral M.2 modules
++
++PCI ID: `1ac1:089a` (Global Unichip / Apex). Host driver: out-of-tree **gasket
+++ apex** DKMS, node `/dev/apex_0`. Official packages lag kernels 6.8+; SLE
++Micro / Harvester kernels will need a maintained DKMS fork or **Mode A**: VFIO
++the function into a guest that runs Apex
++([gasket-driver](https://github.com/google/gasket-driver), PCI `089a` reports
++in [edgetpu#890](https://github.com/google-coral/edgetpu/issues/890)).
++
++Default for Coral on Nexus: **Mode A**. Host DKMS on the ISO is a follow-up.
++
++The demo dashboard’s “Google Coral Edge TPU” row is a placeholder; live mode
++must show the real `1ac1:089a` device or `null` / waiting.
++
++## First-boot agent (proposed, not implemented)
++
++Mirror `memory_tiering.py`:
++
++1. **Discover** — parse `lspci -nn` + sysfs against the allowlist. Record
++   IOMMU group, current kmod, NUMA node.
++2. **Plan** — default `mode: vfio` for every matched card. `mode: shared` only
++   when `acceleration.<vendor>Shared: true` in `/etc/nexus/config.yaml`.
++3. **Apply (vfio)** — ensure `pcidevices-controller` Addon is enabled; create
++   `PCIDeviceClaim` per BDF; do not bind NICs, storage controllers, or Intel
++   IGP. IOMMU groups: claim the whole group or refuse.
++4. **Apply (shared)** — deploy the **one** matching upstream DaemonSet
++   (Gaudi plugin, Intel FPGA plugin, Xilinx FPGA plugin, QAic plugin). Never
++   load XRT on a V80 node.
++5. **Advertise** — node labels `nexus.io/accel.fpga=amd-alveo|intel-dfl`,
++   `nexus.io/accel.npu=gaudi|qaic`, `nexus.io/accel.tpu=coral`. Metrics API
++   `GET /api/v1/telemetry/accelerators` returns inventory + `waitingForHardware`.
++6. **Cockpit** — Acceleration dashboard slices that payload. Wizard exposes
++   detected cards and the vfio vs shared toggle. GPU passthrough stays NVIDIA
++   / AMD GPU via the existing Harvester NVIDIA toolkit + PCIDevices path.
++
++Boot params when vfio is selected, example:
++
++```
++intel_iommu=on iommu=pt vfio-pci.ids=1da3:1063,1ac1:089a,17cb:a100
++```
++
++AMD hosts use `amd_iommu=on`. Do not add `vfio-pci.ids` for Intel FPGA until
++DFL discovery confirms an accelerator function (avoid stealing NICs).
++
++## Wizard / config sketch
++
++```yaml
++acceleration:
++  gpuPassthrough: false
++  fpgaPassthrough: true          # Mode A for 10ee: and Intel DFL
++  npuPassthrough: true           # Mode A for 1da3: and 17cb:a100
++  tpuPassthrough: true           # Mode A for 1ac1:089a
++  sharedPlugins:
++    gaudi: false                 # habana.ai/gaudi for pods
++    intelFpga: false             # fpga.intel.com
++    xilinxFpga: false            # XRT U-series only, never V80
++    qaic: false                  # qualcomm.com/qaic
++```
++
++Validation: shared + vfio for the same PCI ID is an error. GPU passthrough
++still requires NUMA pinning (existing Machine Wizard rule).
++
++## What Nexus will not do
++
++- Flash Alveo shells or Gaudi CPLD as part of first boot.
++- Support Google Cloud TPU (no physical card).
++- Treat Intel Core Ultra NPU as an add-in card.
++- Ship Hailo/Coral DKMS on the ISO until a signed, SLE Micro–tested package
++  exists.
++- Invent utilization % for vfio-bound devices (guest owns the counter). Host
++  metrics stay `null` with `unavailableMetrics` listed.
++
++## Sources
++
++- [Harvester PCI Devices](https://docs.harvesterhci.io/v1.4/advanced/addons/pcidevices)
++- [harvester/pcidevices](https://github.com/harvester/pcidevices)
++- [AMD Alveo V80](https://www.amd.com/en/products/accelerators/alveo/v80.html)
++- [AVED vs XRT on V80](https://xilinx.github.io/AVED/latest/How-to+install+and+run+a+pre-built+AVED+design+on+an+ALVEO+card.html)
++- [Xilinx Kubernetes Device Plugin](https://docs.amd.com/r/en-US/Xilinx_Kubernetes_Device_Plugin/Xilinx_Kubernetes_Device_Plugin)
++- [Intel FPGA device plugin](https://intel.github.io/intel-device-plugins-for-kubernetes/cmd/fpga_plugin/README.html)
++- [Intel Gaudi products](https://www.intel.com/content/www/us/en/products/details/processors/ai-accelerators/gaudi.html)
++- [Gaudi Kubernetes operator](https://docs.habana.ai/en/latest/Installation_Guide/Additional_Installation/Kubernetes_Installation/Kubernetes_Operator.html)
++- [Gaudi VM / VFIO IDs](https://docs.habana.ai/en/latest/Virtualization/Configuring_VMs_on_Gaudi.html)
++- [Intel NPU plugin (on-die)](https://intel.github.io/intel-device-plugins-for-kubernetes/cmd/npu_plugin/README.html)
++- [Linux AIC100 / qaic](https://docs.kernel.org/accel/qaic/aic100.html)
++- [Qualcomm Cloud AI Kubernetes](https://quic.github.io/cloud-ai-sdk-pages/latest/Getting-Started/Deployment/Kubernetes/index)
++- [Coral products](https://gweb-coral-full.uc.r.appspot.com/products)
++- [Coral vs Cloud TPU FAQ](https://gweb-coral-full.uc.r.appspot.com/docs/edgetpu/faq/)
++- [Hailo-8 M.2](https://hailo.ai/products/ai-accelerators/hailo-8-m2-ai-acceleration-module/)
+-- 
+2.43.0
+
