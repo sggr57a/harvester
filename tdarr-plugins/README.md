@@ -130,9 +130,24 @@ model loads strictly at build time**. Requires the NVIDIA driver +
 ### Option B — Bare-metal node
 
 Copy `swift-srgan/swift_srgan_upscale.py` to `/opt/swift-srgan/`, place
-`swift_srgan_4x.pth` next to it (or set `SRGAN_MODEL_PATH`), copy
-`scripts/tdarr-upscale-ai.sh` to `/usr/local/bin/` (`chmod +x`), and install
-`torch`/`numpy` plus an ffmpeg with `hevc_nvenc`.
+`swift_srgan_4x.pth` next to it (or set `SRGAN_MODEL_PATH`), and copy
+`scripts/tdarr-upscale-ai.sh` to `/usr/local/bin/` (`chmod +x`). Ensure an
+ffmpeg with `hevc_nvenc` is on `PATH`.
+
+On modern Debian/Ubuntu, system-wide `pip install` is blocked (PEP 668,
+"externally-managed-environment"), so install torch into a **venv**:
+
+```bash
+sudo apt install -y python3-venv python3-full
+sudo python3 -m venv /opt/swift-srgan/venv
+sudo /opt/swift-srgan/venv/bin/pip install --no-cache-dir --upgrade pip
+sudo /opt/swift-srgan/venv/bin/pip install --no-cache-dir "numpy<2" torch torchvision \
+  --index-url https://download.pytorch.org/whl/cu121   # match your driver (cu118/cu124/...)
+```
+
+The wrapper auto-detects `/opt/swift-srgan/venv/bin/python`; otherwise set
+`PYTHON_BIN` to your interpreter. Verify CUDA:
+`/opt/swift-srgan/venv/bin/python -c "import torch; print(torch.cuda.is_available())"`.
 
 ---
 

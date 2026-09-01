@@ -61,7 +61,15 @@ OUTPUT="${2:-}"
 [ -f "$INPUT" ]  || die "Input file does not exist: $INPUT"
 
 ENGINE="${ENGINE:-swift-srgan}"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+# Resolve the Python interpreter. Prefer an explicit PYTHON_BIN, then a
+# dedicated venv (recommended on PEP-668 "externally-managed" systems), then
+# fall back to the system python3.
+if [ -z "${PYTHON_BIN:-}" ]; then
+  for _cand in /opt/swift-srgan/venv/bin/python /opt/tdarr-ai/venv/bin/python; do
+    if [ -x "$_cand" ]; then PYTHON_BIN="$_cand"; break; fi
+  done
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 NVENC_CQ="${NVENC_CQ:-19}"
 NVENC_PRESET="${NVENC_PRESET:-p6}"
