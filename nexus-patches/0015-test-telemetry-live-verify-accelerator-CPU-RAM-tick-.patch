@@ -1,0 +1,350 @@
+From 668b121a4d2624e8d5157aa294e65d3da3b3b120 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 16:14:12 +0000
+Subject: [PATCH] test(telemetry): live-verify accelerator CPU/RAM tick and fix
+ dashboards collector
+
+collect_dashboards_live called _parse_cpu_cores without importing it, so the
+dashboards payload crashed before Acceleration or environment.accelerators
+could be served. Import the helper and cover the environment tick, live
+collectors, and CPU/RAM dashboard wiring.
+---
+ .../usr/lib/nexus/dashboard_collectors.py     |   1 +
+ installer/tests/dashboard-collectors.test.ts  | 118 ++++++++++++++++++
+ .../tests/hardware-dashboard-wiring.test.ts   |  46 +++++++
+ installer/tests/installer.test.ts             |   6 +
+ src/lib/liveTelemetry.test.ts                 |  19 +++
+ src/lib/telemetry/effectiveTelemetry.test.ts  |  70 +++++++++++
+ 6 files changed, 260 insertions(+)
+ create mode 100644 installer/tests/dashboard-collectors.test.ts
+ create mode 100644 installer/tests/hardware-dashboard-wiring.test.ts
+
+diff --git a/installer/overlay/usr/lib/nexus/dashboard_collectors.py b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+index c573540f..34dff378 100644
+--- a/installer/overlay/usr/lib/nexus/dashboard_collectors.py
++++ b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+@@ -19,6 +19,7 @@ from cluster_metrics import (
+     _monitoring_addon_enabled,
+     _node_capacity_usage,
+     _parse_bytes,
++    _parse_cpu_cores,
+     _save_state,
+ )
+ 
+diff --git a/installer/tests/dashboard-collectors.test.ts b/installer/tests/dashboard-collectors.test.ts
+new file mode 100644
+index 00000000..55baac44
+--- /dev/null
++++ b/installer/tests/dashboard-collectors.test.ts
+@@ -0,0 +1,118 @@
++/**
++ * Live collector contracts: accelerator summary rides the same tick as CPU/RAM.
++ *
++ * Exercises cluster_metrics / dashboard_collectors against this host. Fake PCI
++ * trees live in accelerator-inventory.test.ts; this file checks the BFF wiring.
++ */
++
++import { execFileSync } from 'node:child_process';
++import { mkdtempSync, rmSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { join, resolve } from 'node:path';
++import { afterAll, describe, expect, it } from 'vitest';
++
++const OVERLAY = resolve(__dirname, '../overlay/usr/lib/nexus');
++const workdir = mkdtempSync(join(tmpdir(), 'nexus-dash-collect-'));
++
++afterAll(() => rmSync(workdir, { recursive: true, force: true }));
++
++function py<T>(snippet: string): T {
++  const script = [`import json, sys`, `sys.path.insert(0, ${JSON.stringify(OVERLAY)})`, snippet].join('\n');
++  const out = execFileSync('python3', ['-c', script], {
++    encoding: 'utf-8',
++    env: {
++      ...process.env,
++      NEXUS_TELEMETRY_STATE: join(workdir, 'telemetry-state.json'),
++    },
++  });
++  return JSON.parse(out) as T;
++}
++
++describe('accelerator summary on the CPU/RAM environment tick', () => {
++  it('cluster_metrics._collect_accelerator_summary returns a compact pulse, never utilization', () => {
++    const summary = py<{
++      available: boolean;
++      cards: number;
++      hottestC: number | null;
++      waitingForHardware: string[];
++      devices: unknown[];
++    }>(
++      [
++        'import cluster_metrics as cm',
++        'print(json.dumps(cm._collect_accelerator_summary()))',
++      ].join('\n'),
++    );
++    expect(summary.available).toBe(true);
++    expect(summary.cards).toBeGreaterThanOrEqual(0);
++    expect(summary.hottestC === null || typeof summary.hottestC === 'number').toBe(true);
++    expect(summary.waitingForHardware.length).toBeGreaterThan(0);
++    expect(Array.isArray(summary.devices)).toBe(true);
++  });
++
++  it('collect_environment attaches accelerators next to cpuPercent and ramPercent', () => {
++    const payload = py<{
++      skipped?: boolean;
++      cpuPercent: number | null;
++      ramPercent: number | null;
++      accelerators?: { cards: number; hottestC: number | null; waitingForHardware: string[] };
++      metricSources?: Record<string, string>;
++    }>(
++      [
++        'import cluster_metrics as cm',
++        'if not cm._find_kubeconfig():',
++        '    print(json.dumps({"skipped": True}))',
++        'else:',
++        '    env = cm.collect_environment()',
++        '    print(json.dumps({',
++        '        "skipped": False,',
++        '        "cpuPercent": env.get("cpuPercent"),',
++        '        "ramPercent": env.get("ramPercent"),',
++        '        "accelerators": env.get("accelerators"),',
++        '        "metricSources": env.get("metricSources"),',
++        '    }))',
++      ].join('\n'),
++    );
++    if (payload.skipped) return;
++    expect(payload.accelerators).toBeDefined();
++    expect(payload.accelerators?.cards).toBeGreaterThanOrEqual(0);
++    expect(payload.metricSources?.accelerators).toMatch(/sysfs-pci|unavailable/);
++    expect('cpuPercent' in payload).toBe(true);
++    expect('ramPercent' in payload).toBe(true);
++  });
++
++  it('collect_dashboards_live includes environment.accelerators and acceleration inventory', () => {
++    const payload = py<{
++      skipped?: boolean;
++      error?: string;
++      envCards?: number;
++      envHottest?: number | null;
++      accelAvailable?: boolean;
++      accelDevices?: number;
++    }>(
++      [
++        'import cluster_metrics as cm',
++        'if not cm._find_kubeconfig():',
++        '    print(json.dumps({"skipped": True}))',
++        'else:',
++        '    import dashboard_collectors as dc',
++        '    live = dc.collect_dashboards_live()',
++        '    env = live.get("environment") or {}',
++        '    accel = live.get("acceleration") or {}',
++        '    summary = env.get("accelerators") or {}',
++        '    print(json.dumps({',
++        '        "skipped": False,',
++        '        "envCards": summary.get("cards"),',
++        '        "envHottest": summary.get("hottestC"),',
++        '        "accelAvailable": accel.get("available"),',
++        '        "accelDevices": len(accel.get("passThrough") or accel.get("devices") or []),',
++        '    }))',
++      ].join('\n'),
++    );
++    if (payload.skipped) return;
++    expect(payload.error).toBeUndefined();
++    expect(payload.envCards).toBeGreaterThanOrEqual(0);
++    expect(payload.envHottest === null || typeof payload.envHottest === 'number').toBe(true);
++    expect(payload.accelAvailable).toBe(true);
++    expect(payload.accelDevices).toBeGreaterThanOrEqual(0);
++  });
++});
+diff --git a/installer/tests/hardware-dashboard-wiring.test.ts b/installer/tests/hardware-dashboard-wiring.test.ts
+new file mode 100644
+index 00000000..72d757db
+--- /dev/null
++++ b/installer/tests/hardware-dashboard-wiring.test.ts
+@@ -0,0 +1,46 @@
++import { readFileSync } from 'node:fs';
++import { resolve } from 'node:path';
++import { describe, expect, it } from 'vitest';
++
++const ROOT = resolve(__dirname, '../..');
++const src = (rel: string) => readFileSync(resolve(ROOT, rel), 'utf8');
++
++/**
++ * CPU / RAM hardware views must import the shared add-in card strip so FPGA /
++ * GPU / NPU / TPU cannot fall off those dashboards without a test failure.
++ */
++describe('hardware dashboards include add-in card metrics next to CPU/RAM', () => {
++  const views: Array<{ file: string; mustInclude: RegExp[] }> = [
++    {
++      file: 'src/components/EnvironmentTicker.tsx',
++      mustInclude: [/hardwareTickerCells/, /snapshot\.accelerators/],
++    },
++    {
++      file: 'src/components/dashboards/Dashboards.tsx',
++      mustInclude: [/HardwareAddOnTotals/, /HardwareAddOnPanel/, /telemetry\?\.accelerators/],
++    },
++    {
++      file: 'src/components/dashboards/ResourceMonitorHudView.tsx',
++      mustInclude: [/HardwareAddOnTotals/, /HardwareAddOnPanel/, /accelerators/],
++    },
++    {
++      file: 'src/components/dashboards/EnvironmentIntelHudView.tsx',
++      mustInclude: [/HardwareAddOnTotals/, /HardwareAddOnPanel/, /accelerators/],
++    },
++    {
++      file: 'src/components/dashboards/MissionControl.tsx',
++      mustInclude: [/HardwareAddOnTotals/, /HardwareAddOnPanel/, /accelerators/],
++    },
++    {
++      file: 'src/components/dashboards/TelemetryWave.tsx',
++      mustInclude: [/HardwareAddOnTotals/, /HardwareAddOnPanel/, /accelerators/],
++    },
++  ];
++
++  it.each(views)('$file wires accelerator metrics', ({ file, mustInclude }) => {
++    const text = src(file);
++    for (const pattern of mustInclude) {
++      expect(text).toMatch(pattern);
++    }
++  });
++});
+diff --git a/installer/tests/installer.test.ts b/installer/tests/installer.test.ts
+index 32132601..4826acc3 100644
+--- a/installer/tests/installer.test.ts
++++ b/installer/tests/installer.test.ts
+@@ -391,5 +391,11 @@ describe('installer · overlay avoids Elemental /usr/local persistent mount', ()
+     const serve = readFileSync(join(INSTALLER, 'overlay', 'usr', 'lib', 'nexus', 'serve-cockpit.py'), 'utf8');
+     expect(serve).toMatch(/\/api\/v1\/telemetry\/environment/);
+     expect(serve).toMatch(/\/api\/v1\/health\/live/);
++    expect(serve).toMatch(/\/api\/v1\/telemetry\/accelerators/);
++    const metricsSrc = readFileSync(metrics, 'utf8');
++    expect(metricsSrc).toMatch(/"accelerators": accelerators/);
++    const dash = readFileSync(join(INSTALLER, 'overlay', 'usr', 'lib', 'nexus', 'dashboard_collectors.py'), 'utf8');
++    expect(dash).toMatch(/"accelerators": _collect_accelerator_summary\(\)/);
++    expect(dash).toMatch(/_parse_cpu_cores/);
+   });
+ });
+diff --git a/src/lib/liveTelemetry.test.ts b/src/lib/liveTelemetry.test.ts
+index 19cab747..761be7dc 100644
+--- a/src/lib/liveTelemetry.test.ts
++++ b/src/lib/liveTelemetry.test.ts
+@@ -1,5 +1,6 @@
+ import { describe, expect, it } from 'vitest';
+ import { formatNumber, nextSnapshot } from './liveTelemetry';
++import { emptyEnvironmentSnapshot } from './telemetry/emptySnapshot';
+ 
+ describe('nextSnapshot', () => {
+   it('produces an initial snapshot with all required fields', () => {
+@@ -21,6 +22,13 @@ describe('nextSnapshot', () => {
+     expect(snap.accelerators?.byKind.fpga).toBeGreaterThan(0);
+   });
+ 
++  it('keeps the same demo accelerator inventory across ticks', () => {
++    const first = nextSnapshot();
++    const second = nextSnapshot(first);
++    expect(second.accelerators?.cards).toBe(first.accelerators?.cards);
++    expect(second.accelerators?.byKind).toEqual(first.accelerators?.byKind);
++  });
++
+   it('advances tick and emits bounded deltas', () => {
+     const first = nextSnapshot();
+     const second = nextSnapshot(first);
+@@ -41,6 +49,17 @@ describe('nextSnapshot', () => {
+   });
+ });
+ 
++describe('emptyEnvironmentSnapshot', () => {
++  it('reports zero add-in cards and null hottestC when live telemetry is unavailable', () => {
++    const snap = emptyEnvironmentSnapshot(3);
++    expect(snap.tick).toBe(3);
++    expect(snap.cpuPercent).toBe(0);
++    expect(snap.ramPercent).toBe(0);
++    expect(snap.accelerators?.cards).toBe(0);
++    expect(snap.accelerators?.hottestC).toBeNull();
++    expect(snap.accelerators?.devices).toEqual([]);
++  });
++});
+ describe('formatNumber', () => {
+   it('formats large numbers as compact when requested', () => {
+     expect(formatNumber(1_200_000, { compact: true })).toBe('1.20M');
+diff --git a/src/lib/telemetry/effectiveTelemetry.test.ts b/src/lib/telemetry/effectiveTelemetry.test.ts
+index 50d14c66..c5b1468b 100644
+--- a/src/lib/telemetry/effectiveTelemetry.test.ts
++++ b/src/lib/telemetry/effectiveTelemetry.test.ts
+@@ -107,4 +107,74 @@ describe('withTelemetryFallbacks', () => {
+     expect(result?.cpuPercent).toBe(0);
+     expect(result?.totalIops).toBe(0);
+   });
++
++  it('preserves accelerator summary through HUD fallbacks so Resource Monitor keeps PCI cards', () => {
++    const accelerators = {
++      cards: 2,
++      issues: 1,
++      hottestC: 62,
++      byKind: { npu: 1, fpga: 1 },
++      waitingForHardware: ['tpu-coral'],
++      devices: [{ id: '0000:3d:00.0', kind: 'npu', model: 'Intel Gaudi 3 PCIe' }],
++    };
++    const demo = withTelemetryFallbacks(
++      {
++        totalWorkloads: 0,
++        totalIops: 0,
++        ingressMbps: 0,
++        egressMbps: 0,
++        cpuPercent: 0,
++        ramPercent: 0,
++        watts: 0,
++        activeMigrations: 0,
++        openCves: 0,
++        trustScore: 0,
++        tick: 1,
++        accelerators,
++        deltas: {
++          totalWorkloads: 0,
++          totalIops: 0,
++          ingressMbps: 0,
++          egressMbps: 0,
++          cpuPercent: 0,
++          ramPercent: 0,
++          watts: 0,
++          activeMigrations: 0,
++        },
++      },
++      model,
++    );
++    expect(demo?.accelerators?.cards).toBe(2);
++    expect(demo?.accelerators?.hottestC).toBe(62);
++
++    const live = withTelemetryFallbacks(
++      {
++        totalWorkloads: 0,
++        totalIops: 0,
++        ingressMbps: 0,
++        egressMbps: 0,
++        cpuPercent: 0,
++        ramPercent: 0,
++        watts: 0,
++        activeMigrations: 0,
++        openCves: 0,
++        trustScore: 0,
++        tick: 1,
++        accelerators,
++        deltas: {
++          totalWorkloads: 0,
++          totalIops: 0,
++          ingressMbps: 0,
++          egressMbps: 0,
++          cpuPercent: 0,
++          ramPercent: 0,
++          watts: 0,
++          activeMigrations: 0,
++        },
++      },
++      model,
++      { liveMode: true },
++    );
++    expect(live?.accelerators).toEqual(accelerators);
++  });
+ });
+-- 
+2.43.0
+
