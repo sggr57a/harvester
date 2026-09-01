@@ -1,0 +1,230 @@
+From 7a6a5d1c81f8ac9361e98bd3f3d9ba56cdacb9a6 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 15:49:47 +0000
+Subject: [PATCH] chore(release): bump Harvester Nexus to 3.0.0
+
+Eleven production features landed on top of 2.0 (auth, ISO CI, measured
+telemetry, AnyRAID, XDR ingest, live FFT, KubeVirt consoles, memory
+tiering). Stamp package.json, installer/VERSION, ISO names, and the
+feature ConfigMap as 3.0.0 / 3.0.0+nexus.1.
+
+diff --git a/README.md b/README.md
+index 36b74eae..40fd2db5 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,25 @@ Nexus is a next-generation, high-performance, open-source hyperconverged infrast
+ 
+ By unifying the bare-metal agility of Proxmox and Incus (LXC) with the massive cloud-native orchestration of Kubernetes (KubeVirt) and VMware vSphere class enterprise storage/scheduling, nexus represents the ultimate consolidation of computing, storage, and specialized hardware accelerators, including a HUD interface, wizard-driven machine provisioning, Kubernetes manifest generation, storage backend provisioning, and multi-cluster deployment workflows.
+ 
+-> **Version 2.0** lands the features described in [`UPDATED.md`](./UPDATED.md): the Poly-Compute Engine, the Universal Storage Fabric (now including Vitastor with SPDK bypass), hyper-efficient data path acceleration (SPDK / DPDK / vhost-user / NUMA pinning / 1 GiB hugepages), advanced acceleration (GPU + FPGA + smart-NIC pass-through, nested virtualization for AI / ML), **and a built-in 100% open-source XDR / MDR platform** that detects, attributes, and auto-responds to threats across every host, VM, container, pod, and edge endpoint. See the [Nexus 2.0 release](#nexus-20-release) section.
++> **Version 3.0** is the current release. It keeps everything in [`UPDATED.md`](./UPDATED.md) (Poly-Compute, Universal Storage Fabric, XDR / MDR, acceleration) and adds ten-plus production features: authenticated cockpit APIs, a working signed ISO pipeline, measured host telemetry, live AnyRAID, live XDR ingest, Oscilloscope/FFT from real counters, KubeVirt VNC/serial consoles, and Linux CXL/PMem/zswap memory tiering. See [Nexus 3.0 release](#nexus-30-release). The [Nexus 2.0](#nexus-20-release) section is the historical baseline.
++
++## Nexus 3.0 release
++
++Harvester Nexus **3.0.0** (`installer/VERSION` `3.0.0+nexus.1`). ISO artifact: `dist/harvester-nexus-3.0.0+nexus.1.iso`.
++
++Production features added on top of 2.0:
++
++1. **Authenticated cockpit BFF** — every `/api/v1` route requires a session; lockout after failed logins; random bootstrap password instead of shipping `admin`/`admin` on the wire.
++2. **ISO CI that publishes** — root-disk and checkout-order faults fixed so `Build install ISO` can finish; CI stamps `3.0.0+nexus.1.main.<run>.<sha>`.
++3. **Measured host telemetry** — RAPL / IPMI watts, meminfo, vmstat, NIC counters; missing sensors are `null`, never invented.
++4. **Nullable metrics contract** — dashboards render gaps instead of fabricated IOPS, watts, or FFT.
++5. **AnyRAID on LVM** — heterogeneous-capacity slab pool with a real `lvcreate` path, not a catalog stub.
++6. **Live XDR ingest** — Falco, Tetragon, Suricata, and Wazuh alerts feed the SOC views instead of the demo simulator alone.
++7. **Oscilloscope and FFT from the host** — Telemetry Wave plots measured CPU / DRAM / NIC, not a canned waveform.
++8. **KubeVirt VNC and serial consoles** — cockpit attaches through the KubeVirt websocket proxy.
++9. **Linux memory tiering** — CXL Type-3 NUMA demotion, leftover Optane/PMem DAX kmem, zswap plus a bounded NVMe-backed swap file. Not vSphere NVMe-as-RAM. See [`docs/memory-tiering.md`](./docs/memory-tiering.md).
++10. **Live Processor & Memory dashboard** — NUMA, memory_tier nodelists, PSI, hugepages, demote/promote, zswap.
++11. **KubeVirt tiering hints** — `nexus.io/memory-tiering=auto` vs `dram-only`; 1 GiB hugepages pin DRAM-only guests.
+ 
+ ## Nexus 2.0 release
+ 
+@@ -245,7 +263,7 @@ Nexus ships two install paths. **Production** installs the full HCI platform —
+ | **Validate the installer without Docker** | Any Linux/macOS with Node 20+ | 4 GB RAM, git clone | [Validate before building](#2-validate-the-installer-without-docker) |
+ | **Cockpit UI only** (mock data, no cluster) | Ubuntu 24.10+ dev laptop | 4 GB RAM, Node 20+ | [Development cockpit](#development-cockpit-only) |
+ 
+-Current release version: **`1.0.0+nexus.1`** (see `installer/VERSION`). The ISO artifact is `dist/harvester-nexus-1.0.0+nexus.1.iso`.
++Current release version: **`3.0.0+nexus.1`** (see `installer/VERSION`). The ISO artifact is `dist/harvester-nexus-3.0.0+nexus.1.iso`.
+ 
+ ---
+ 
+@@ -394,8 +412,8 @@ Requires Docker, ~30 minutes, and ~25 GB free disk on a **native** (non-nested)
+ 
+ ```bash
+ cd installer
+-make iso-builder    # builds harvester-nexus-iso-builder:1.0.0-nexus.1 Docker image
+-make iso            # produces dist/harvester-nexus-1.0.0+nexus.1.iso
++make iso-builder    # builds harvester-nexus-iso-builder:3.0.0-nexus.1 Docker image
++make iso            # produces dist/harvester-nexus-3.0.0+nexus.1.iso
+ ```
+ 
+ Verify the artifact:
+@@ -418,7 +436,7 @@ The build pipeline (see [`installer/README.md`](./installer/README.md)) bundles:
+ 1. **Write the ISO to USB** (replace `/dev/sdX` with your USB device):
+ 
+    ```bash
+-   sudo dd if=dist/harvester-nexus-1.0.0+nexus.1.iso of=/dev/sdX bs=4M status=progress conv=fsync
++   sudo dd if=dist/harvester-nexus-3.0.0+nexus.1.iso of=/dev/sdX bs=4M status=progress conv=fsync
+    ```
+ 
+ 2. **Boot the target server** from the USB stick. Enter firmware setup and confirm:
+@@ -466,7 +484,7 @@ qemu-system-x86_64 \
+   -smp 8 \
+   -cpu host \
+   -drive file=$HOME/harvester-nexus.qcow2,if=virtio,format=qcow2 \
+-  -cdrom dist/harvester-nexus-1.0.0+nexus.1.iso \
++  -cdrom dist/harvester-nexus-3.0.0+nexus.1.iso \
+   -boot d \
+   -netdev user,id=net0,hostfwd=tcp::8443-:8443,hostfwd=tcp::8080-:8080 \
+   -device virtio-net-pci,netdev=net0 \
+diff --git a/installer/Makefile b/installer/Makefile
+index db996293..9c88b000 100644
+--- a/installer/Makefile
++++ b/installer/Makefile
+@@ -10,7 +10,7 @@
+ REPO_ROOT       := $(shell cd .. && pwd)
+ INSTALLER_DIR   := $(REPO_ROOT)/installer
+ VERSION         := $(shell cat $(INSTALLER_DIR)/VERSION)
+-# Override at build time: `make iso BUILD_VERSION=1.0.0+nexus.1.main.42.abc1234`
++# Override at build time: `make iso BUILD_VERSION=3.0.0+nexus.1.main.42.abc1234`
+ BUILD_VERSION   ?= $(VERSION)
+ # Docker tags cannot contain '+'; keep the human-readable VERSION for ISO filenames.
+ DOCKER_TAG      := $(subst +,-,$(VERSION))
+diff --git a/installer/README.md b/installer/README.md
+index 471f1767..c9470df8 100644
+--- a/installer/README.md
++++ b/installer/README.md
+@@ -18,7 +18,7 @@ This directory holds everything needed to produce **`harvester-nexus-<version>.i
+ ```
+ installer/
+ ├── README.md                         (this file)
+-├── VERSION                           "1.0.0+nexus.1"
++├── VERSION                           "3.0.0+nexus.1"
+ ├── Dockerfile                        ISO builder image (BCI golang + Dapper toolchain + Node 20)
+ ├── Makefile                          overlay / simulate / iso-builder / iso / clean / tests
+ ├── build-iso.sh                      6-stage build pipeline
+@@ -124,7 +124,7 @@ CI stores heavy ISO build artifacts under `/var/lib/docker/nexus-ci/` on the exp
+ qemu-system-x86_64 \
+   -enable-kvm -m 16384 -smp 8 -cpu host \
+   -drive file=harvester-nexus.qcow2,if=virtio,size=200G \
+-  -cdrom dist/harvester-nexus-1.0.0+nexus.1.iso \
++  -cdrom dist/harvester-nexus-3.0.0+nexus.1.iso \
+   -boot d \
+   -netdev user,id=net0,hostfwd=tcp::8443-:8443,hostfwd=tcp::8080-:8080 -device virtio-net,netdev=net0
+ ```
+diff --git a/installer/VERSION b/installer/VERSION
+index cb0ad687..8fe7de7e 100644
+--- a/installer/VERSION
++++ b/installer/VERSION
+@@ -1 +1 @@
+-1.0.0+nexus.1
++3.0.0+nexus.1
+diff --git a/installer/build-iso.sh b/installer/build-iso.sh
+index 15bb2d4c..bfd55d57 100755
+--- a/installer/build-iso.sh
++++ b/installer/build-iso.sh
+@@ -26,7 +26,7 @@ INSTALLER_DIR=${REPO_ROOT}/installer
+ BUILD_DIR=${BUILD_DIR:-/build}
+ NEXUS_OVERLAY=${HARVESTER_NEXUS_OVERLAY:-${BUILD_DIR}/nexus-overlay}
+ DIST=${HARVESTER_NEXUS_DIST:-${BUILD_DIR}/dist}
+-VERSION=${NEXUS_VERSION:-$(cat "${REPO_ROOT}/installer/VERSION" 2>/dev/null || echo "1.0.0+nexus.1")}
++VERSION=${NEXUS_VERSION:-$(cat "${REPO_ROOT}/installer/VERSION" 2>/dev/null || echo "3.0.0+nexus.1")}
+ HARVESTER_INSTALLER_REPO=${HARVESTER_INSTALLER_REPO:-https://github.com/harvester/harvester-installer.git}
+ HARVESTER_INSTALLER_REF=${HARVESTER_INSTALLER_REF:-master}
+ ISO_HOST_PATH="/usr/local/go/bin:/usr/local/bin:/usr/sbin:/sbin:/usr/bin:/bin"
+diff --git a/installer/manifests/99-nexus-features.yaml b/installer/manifests/99-nexus-features.yaml
+index 4aa06b08..a7ca3e97 100644
+--- a/installer/manifests/99-nexus-features.yaml
++++ b/installer/manifests/99-nexus-features.yaml
+@@ -73,5 +73,5 @@ data:
+   default.launch-variant:  "concentric-boot"
+ 
+   # Versioning so the cockpit knows which contract it's talking to
+-  config.version:          "1.0.0"
+-  installer.build:         "harvester-nexus-1.0.0+nexus.1"
++  config.version:          "3.0.0"
++  installer.build:         "harvester-nexus-3.0.0+nexus.1"
+diff --git a/installer/overlay/usr/bin/nexus-bootstrap b/installer/overlay/usr/bin/nexus-bootstrap
+index a083b68a..36392374 100755
+--- a/installer/overlay/usr/bin/nexus-bootstrap
++++ b/installer/overlay/usr/bin/nexus-bootstrap
+@@ -66,8 +66,9 @@ else
+ fi
+ 
+ # Record what we installed so the cockpit can show install provenance.
++NEXUS_STAMP=$(tr -d '[:space:]' < /etc/nexus/version 2>/dev/null || echo "3.0.0+nexus.1")
+ {
+-  echo "installerVersion: harvester-nexus-1.0.0+nexus.1"
++  echo "installerVersion: harvester-nexus-${NEXUS_STAMP}"
+   echo "completedAt: $(date -Iseconds)"
+   echo "manifestsApplied: ${APPLIED}"
+   echo "configFile: ${CONFIG_FILE}"
+diff --git a/installer/simulator/simulate.mjs b/installer/simulator/simulate.mjs
+index d2c358ba..febb88cd 100755
+--- a/installer/simulator/simulate.mjs
++++ b/installer/simulator/simulate.mjs
+@@ -303,7 +303,7 @@ function writeReport(cfg, manifests, cluster, login) {
+     apiVersion: 'nexus.io/v1',
+     kind: 'NexusInstallSimulationReport',
+     completedAt: new Date().toISOString(),
+-    installerVersion: 'harvester-nexus-' + (process.env.NEXUS_VERSION ?? '1.0.0+nexus.1'),
++    installerVersion: 'harvester-nexus-' + (process.env.NEXUS_VERSION ?? '3.0.0+nexus.1'),
+     summary: {
+       checks: checks.length,
+       passed: checks.filter((c) => c.status === 'pass').length,
+diff --git a/installer/tests/ci-version.test.ts b/installer/tests/ci-version.test.ts
+index 54474639..33a5fb2f 100644
+--- a/installer/tests/ci-version.test.ts
++++ b/installer/tests/ci-version.test.ts
+@@ -9,7 +9,7 @@ describe('installer · ci-version.sh', () => {
+       encoding: 'utf8',
+       env: { ...process.env, GITHUB_RUN_NUMBER: '', GITHUB_SHA: '' },
+     }).trim();
+-    expect(version).toMatch(/^1\.0\.0\+nexus\.1\.local\.[0-9a-f]{7}$/);
++    expect(version).toMatch(/^3\.0\.0\+nexus\.1\.local\.[0-9a-f]{7}$/);
+   });
+ 
+   it('includes run number and sha when CI env vars are set', () => {
+@@ -22,6 +22,6 @@ describe('installer · ci-version.sh', () => {
+         GITHUB_SHA: 'abcdef1234567890',
+       },
+     }).trim();
+-    expect(version).toBe('1.0.0+nexus.1.main.42.abcdef1');
++    expect(version).toBe('3.0.0+nexus.1.main.42.abcdef1');
+   });
+ });
+diff --git a/package-lock.json b/package-lock.json
+index 7969e742..0d3f0e2e 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,12 +1,12 @@
+ {
+   "name": "nexus",
+-  "version": "2.0.0",
++  "version": "3.0.0",
+   "lockfileVersion": 3,
+   "requires": true,
+   "packages": {
+     "": {
+       "name": "nexus",
+-      "version": "2.0.0",
++      "version": "3.0.0",
+       "dependencies": {
+         "@codemirror/lang-yaml": "^6.1.3",
+         "@codemirror/theme-one-dark": "^6.1.3",
+diff --git a/package.json b/package.json
+index d1e7a537..376a4f24 100644
+--- a/package.json
++++ b/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "nexus",
+   "private": true,
+-  "version": "2.0.0",
++  "version": "3.0.0",
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+-- 
+2.43.0
+
