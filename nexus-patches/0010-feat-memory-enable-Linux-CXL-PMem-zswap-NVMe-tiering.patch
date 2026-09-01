@@ -1,0 +1,2690 @@
+From 5a979e4c986ca3dfdfcba721bfa55a0976eda9a9 Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 15:46:31 +0000
+Subject: [PATCH] feat(memory): enable Linux CXL/PMem/zswap/NVMe tiering when
+ hardware exists
+
+Consume the install-wizard memory_tiering flags. Discover CXL, DAX/PMem,
+HBM NUMA, DAMON, weighted interleave, and spare NVMe; enable demotion and
+NUMA balancing tiering mode for capacity policy; bind leftover Optane
+App Direct via dax kmem; put zswap in front of a bounded swap file.
+Future sysfs (CXL pooling, pghot, package-aware, guest CXL/NVDIMM) is
+recorded as waiting_for_hardware until the kernel exposes it.
+
+Live Processor & Memory now plots real meminfo, vmstat, PSI, zswap, swap,
+and memory_tier nodelists instead of the demo catalog.
+---
+ AGENTS.md                                     |    1 +
+ README.md                                     |    3 +-
+ docs/memory-tiering.md                        |   96 ++
+ installer/README.md                           |    6 +-
+ .../nexus-wizard-questions.yaml               |   21 +
+ installer/manifests/50-memory-tiering.yaml    |   54 +
+ installer/manifests/99-nexus-features.yaml    |    6 +
+ installer/overlay/etc/nexus/config.yaml       |   36 +
+ .../etc/sysctl.d/99-nexus-memory-tiering.conf |    8 +
+ .../system/nexus-memory-tiering.service       |   17 +
+ .../systemd/system/nexus-memory-tiering.timer |   12 +
+ .../rules.d/99-nexus-memory-tiering.rules     |    4 +
+ installer/overlay/system/oem/92_nexus.yaml    |    8 +-
+ .../overlay/usr/bin/nexus-memory-tiering      |   11 +
+ installer/overlay/usr/bin/nexus-postinstall   |    4 +-
+ .../usr/lib/nexus/dashboard_collectors.py     |   17 +
+ .../overlay/usr/lib/nexus/memory_tiering.py   | 1062 +++++++++++++++++
+ .../overlay/usr/lib/nexus/serve-cockpit.py    |   12 +
+ installer/tests/installer.test.ts             |    6 +-
+ installer/tests/memory-tiering.test.ts        |  395 ++++++
+ src/App.tsx                                   |    8 +-
+ src/components/NexusMachineWizard.tsx         |   13 +-
+ src/components/dashboards/Dashboards.tsx      |  147 ++-
+ src/lib/dashboards.ts                         |   16 +-
+ src/lib/harvesterMachineWizard.test.ts        |    2 +
+ src/lib/harvesterMachineWizard.ts             |   15 +-
+ src/lib/telemetry/dashboardAdapters.test.ts   |   19 +
+ src/lib/telemetry/dashboardAdapters.ts        |   85 ++
+ src/lib/telemetry/dashboardTypes.ts           |   40 +
+ src/styles.css                                |    3 +
+ 30 files changed, 2069 insertions(+), 58 deletions(-)
+ create mode 100644 docs/memory-tiering.md
+ create mode 100644 installer/manifests/50-memory-tiering.yaml
+ create mode 100644 installer/overlay/etc/sysctl.d/99-nexus-memory-tiering.conf
+ create mode 100644 installer/overlay/etc/systemd/system/nexus-memory-tiering.service
+ create mode 100644 installer/overlay/etc/systemd/system/nexus-memory-tiering.timer
+ create mode 100644 installer/overlay/etc/udev/rules.d/99-nexus-memory-tiering.rules
+ create mode 100755 installer/overlay/usr/bin/nexus-memory-tiering
+ create mode 100755 installer/overlay/usr/lib/nexus/memory_tiering.py
+ create mode 100644 installer/tests/memory-tiering.test.ts
+
+diff --git a/AGENTS.md b/AGENTS.md
+index b5592b0e..13357656 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -47,3 +47,4 @@ because it has no backend to authenticate against.
+ - **ISO builds on `main`:** every push to `main` runs `.github/workflows/build-iso.yml` and publishes a pre-release ISO under GitHub Releases (`iso-main-<run>`). See `installer/README.md` for download instructions.
+ - Live XDR events come from Falco / Tetragon / Suricata / Wazuh pod logs via `xdr_ingest.py`; Kubernetes Warning events keep a derived severity instead of a hardcoded `medium`.
+ - Live consoles attach through `console_proxy.py` (`/api/v1/console/{vnc,serial,exec}`) onto KubeVirt subresources or `kubectl exec`. `src/lib/demoConsole.ts` is demo-mode only.
++- Memory tiering is host-side (`memory_tiering.py` + `nexus-memory-tiering.service`). Live Processor & Memory reads `/proc` and `/sys` (demotion, zswap, swap, PSI, NUMA). Do not fabricate tier capacity when the hardware is absent — list it under `waitingForHardware`.
+diff --git a/README.md b/README.md
+index bc46956e..36b74eae 100644
+--- a/README.md
++++ b/README.md
+@@ -13,6 +13,7 @@ Highlights:
+ - **Poly-Compute Engine** — runs KubeVirt VMs, Incus / LXC system containers, and native Kubernetes pods on the same bare-metal loop, with NUMA-local DRAM affinity, 1 GiB hugepages for KubeVirt, nested-virt opt-in pools, and cross-socket cost penalties on the scheduler.
+ - **Universal Storage Fabric** — every storage backend in the catalog is wired into CSI / direct-host paths, including **Vitastor** with SPDK userspace queues, NVMe-oF / RDMA with userspace bypass, ZFS with copy-on-write + zstd + ARC cache, **AnyRAID** with heterogeneous-capacity drive slabbing, iSCSI multipath via `vfio-pci`, and NFS / SMB through the subpath driver for RWX shares.
+ - **Hardware acceleration** — SPDK userspace NVMe-oF queues, DPDK polled-mode rings, vhost-user fast paths, NUMA pinning with 1 GiB hugepages, GPU / FPGA / smart-NIC / TPU pass-through (vfio-pci / SR-IOV / mdev), and L1 nested virtualization for training, inference, sandbox, and CI pools.
++- **Memory tiering** — Linux NUMA demotion/promotion for CXL Type-3 and leftover Optane/PMem (DAX kmem), HBM when the kernel groups it as a faster node, zswap plus a bounded NVMe-backed swap file as the last safety net, DAMON/weighted-interleave/pghot/CXL-pooling hooks that activate when those sysfs trees appear. This is **not** vSphere NVMe-as-RAM; guests do not see extra DRAM. See [`docs/memory-tiering.md`](./docs/memory-tiering.md).
+ - **Machine Wizard 2.0** — install YAML with `poly_compute` and `hardware_acceleration` blocks plus boot-parameter switches (`nexus.poly_compute=kubevirt,incus,pods`, `nexus.acceleration.spdk=true`, `nexus.acceleration.hugepages_1g=64`, `nexus.acceleration.gpu_passthrough=true`). Validation refuses configs that turn off every runtime or enable GPU pass-through without NUMA pinning.
+ - **Built-in XDR / MDR platform (100% FOSS)** — every Nexus install ships with a complete detect-and-respond stack: 17 open-source sensors (Falco, Tetragon, Wazuh, Trivy, Grype, Syft, Suricata, Hubble, OpenSearch, MISP, kube-bench, kube-hunter, Polaris, OpenCanary, OpenSCAP, Lynis), 10 free threat-intel feeds (MISP, OTX, ThreatFox, URLhaus, Feodotracker, ETOpen, MITRE ATT&CK, NVD, OSV, internal allowlist), 18 Sigma-style detection rules covering all seven MITRE ATT&CK kill-chain phases, 10 automated response actions that emit real Kubernetes manifests (Cilium NetworkPolicy isolate, Harvester host cordon/drain, KubeVirt `VirtualMachineSnapshot`, Incus snapshot, Tetragon `TracingPolicy` SIGKILL, ArgoCD rollback, Trivy image block, Cilium CCNP egress-domain block), and APT geo-attribution that maps sources to actors like APT28 / LAZARUS. No paid SKUs, no subscriptions.
+ - **Themable cockpit** — four cool-tone switchable themes (Route Grid, Arctic Hologram, Arctic Command, Ice Spectrum). Theme selection persists in `localStorage`.
+@@ -37,7 +38,7 @@ Nexus is the updated Harvester fork with:
+ - **Environment Intelligence** and **Activity Command** — facility telemetry, automation queues, approval flows, in-flight migrations, backup status, and security-scan activity.
+ - **Live Environment Ticker** — rolling cluster-wide stats (workloads, IOPS, ingress / egress Mb/s, CPU %, DRAM %, power, in-flight migrations, open CVEs, trust score) pinned above every dashboard.
+ - **Four cool-tone cockpit themes** (Route Grid, Arctic Hologram, Arctic Command, Ice Spectrum) with persistent `localStorage` selection.
+-- **Eight additional themed data dashboards**: Networking, Storage, Machines & Containers, Processor & Memory, Poly-Compute Engine, Acceleration, Operations & Compliance, Resource Monitoring.
++- **Eight additional themed data dashboards**: Networking, Storage, Machines & Containers, Processor & Memory (live NUMA / CXL / PMem / zswap / swap / PSI / vmstat), Poly-Compute Engine, Acceleration, Operations & Compliance, Resource Monitoring.
+ 
+ ### Security · Detection &amp; response (XDR / MDR)
+ - **Endpoint coverage** — every host, KubeVirt VM, Incus / LXC container, Docker container, Kubernetes pod, edge node, and third-party integration is enrolled and inventoried.
+diff --git a/docs/memory-tiering.md b/docs/memory-tiering.md
+new file mode 100644
+index 00000000..8d726568
+--- /dev/null
++++ b/docs/memory-tiering.md
+@@ -0,0 +1,96 @@
++# Memory tiering
++
++Nexus uses the **Linux kernel memory-tier framework**, not VMware’s NVMe-as-RAM
++page store. Byte-addressable devices become NUMA nodes; cold pages demote and
++hot pages promote. Block devices (NVMe/SSD) are a last-resort **zswap + swap**
++tier. Missing hardware is recorded as `waitingForHardware` and is enabled the
++moment the firmware or kernel exposes it.
++
++## What was added
++
++| Path | Role |
++|---|---|
++| `installer/overlay/usr/lib/nexus/memory_tiering.py` | Discover, plan, apply, metrics |
++| `installer/overlay/usr/bin/nexus-memory-tiering` | First-boot / timer / udev entrypoint |
++| `installer/overlay/etc/systemd/system/nexus-memory-tiering.service` | Apply sysctls when the node boots |
++| `installer/overlay/etc/systemd/system/nexus-memory-tiering.timer` | Re-scan every 5 minutes for hotplug |
++| `installer/overlay/etc/udev/rules.d/99-nexus-memory-tiering.rules` | CXL / DAX / NVMe add → re-run |
++| `installer/overlay/etc/sysctl.d/99-nexus-memory-tiering.conf` | `vm.swappiness=20` |
++| `installer/overlay/etc/nexus/config.yaml` `memoryTiering:` | Install-time policy |
++| `installer/manifests/50-memory-tiering.yaml` | KubeVirt annotation / preference hints |
++| `GET /api/v1/telemetry/memory-tiering` | Live snapshot for the cockpit |
++| Processor & Memory dashboard (live) | NUMA, tiers, PSI, swap, hugepages, vmstat, zswap |
++
++The install wizard still writes `nexus.memory_tiering` and
++`nexus.features.memory_tiering=…`. Those flags are now **consumed**.
++
++## What was not added (and why)
++
++- **vSphere-style NVMe Memory Tiering** (hypervisor classifies guest 4K pages
++  onto a reserved NVMe partition, guests see DRAM+NVMe as one RAM pool) is
++  **not** in Linux or KubeVirt. The closest host equivalent is making guest RAM
++  swappable (no 1 GiB hugepages on *tierable* VMs) so zswap+NVMe swap can take
++  cold QEMU pages. GPU / TDX / latency-critical VMs should stay
++  `nexus.io/memory-tiering=dram-only` with hugepages.
++- **Wiping a whole NVMe namespace** to make swap. The agent records a candidate
++  unused NVMe and creates a **bounded swap file** (max 8 GiB) under
++  `/var/lib/nexus/memory-tiering/swapfile`. Operators who want a dedicated
++  partition run `mkswap` / `swapon` themselves.
++- **New PCRAM SKUs.** Intel Optane PMem is EOL. `phase-change` is a **legacy
++  DAX kmem** path for remaining DIMMs.
++
++## Tiers (fast → slow)
++
++1. **HBM** — faster CPU-less NUMA node when the kernel places it in a higher
++   memory tier. Waiting if absent.
++2. **DRAM** — local CPU nodes. Always present.
++3. **CXL Type-3** — memory-only NUMA nodes / `/sys/bus/cxl`. Demotion +
++   `kernel.numa_balancing=2` when a slower node exists.
++4. **Phase-change / PMem** — `/dev/dax*` bound to `dax/kmem` (`system-ram`).
++5. **zswap** — compressed DRAM pool in front of swap.
++6. **Hypervisor NVMe directory** — `/var/lib/nexus/memory-tier-nvme` for a
++   future QEMU `memory-backend-file` hook.
++7. **Swap** — NVMe/SSD swap file or partition.
++
++## Policies
++
++- `capacity` (default) — demote cold pages, promote hot pages (working-set stays
++  in DRAM).
++- `bandwidth` — `MPOL_WEIGHTED_INTERLEAVE` instead of demotion; pages stay where
++  they were allocated.
++
++## Future hooks (no-op until sysfs appears)
++
++- CXL pooling / switches (`/sys/bus/cxl/devices/switch*`)
++- Compressed CXL QoS class
++- DAMON and `damon_tier`
++- `pghot` promotion
++- Package-aware `/sys/devices/system/package/`
++- Guest CXL / NVDIMM QEMU topology (`nexus.io/guest-cxl=reserved` until KubeVirt
++  models the device)
++
++## Metrics
++
++Live payload includes:
++
++- `meminfo` — MemTotal/Available, SwapTotal/Free, AnonPages, Committed_AS,
++  VmallocUsed, Active/Inactive anon+file, Shmem, hugepages
++- `vmstat` — pgdemote_*, pgpromote_*, pswpin/pswpout, zswpin/zswpout, pgfault /
++  pgmajfault, numa_hit/miss/foreign, pgmigrate_success (`null` if the kernel
++  has no such counter)
++- `psi` — memory/cpu/io some+full avg10/60/300
++- `zswap` — enabled, compressor, pool percent, stored_pages, writeback
++- `/proc/swaps`, hugepage pools, memory_tier nodelists, demotion_enabled,
++  numa_balancing
++
++## KubeVirt
++
++ConfigMap `nexus-memory-tiering` in `nexus-cockpit` documents:
++
++- `nexus.io/memory-tiering=auto` — swappable guest RAM (no 1 GiB hugepages)
++- `nexus.io/memory-tiering=dram-only` — hugepages, never demote
++- `nexus.io/guest-cxl` / `nexus.io/guest-nvdimm` — reserved
++
++1 GiB hugepages **pin DRAM** and prevent demotion of those pages. The default
++poly-compute `hugepages1g` reservation is unchanged for DPDK/GPU VMs; only VMs
++that opt into `auto` should skip hugepages.
+diff --git a/installer/README.md b/installer/README.md
+index 824fb0a5..471f1767 100644
+--- a/installer/README.md
++++ b/installer/README.md
+@@ -8,6 +8,8 @@ This directory holds everything needed to produce **`harvester-nexus-<version>.i
+ - **The full Nexus cockpit** — every dashboard, widget, theme, wizard, and view documented in the top-level `README.md`.
+ - **Built-in XDR / MDR platform** — 12 FOSS sensors (Falco, Tetragon, Wazuh, Suricata, Hubble, Trivy, Polaris, kube-bench, OpenSearch, Grype, Syft) + 18 Sigma detection rules + 10 free intel feeds + 10 automated response actions.
+ - **AnyRAID CSI driver** — slab-based RAID over heterogeneous-capacity drives.
++- **Memory tiering agent** — CXL / PMem DAX kmem / zswap / NVMe swap file, with
++  live Processor & Memory metrics (`docs/memory-tiering.md`).
+ - **First-boot wizard** with Nexus-specific questions on top of Harvester's mandatory mode / network / VIP / NTP set.
+ - **Default cockpit credentials of `admin` / `admin`** with **forced password change on first login** so unattended installs work out of the box without leaving the cluster with weak credentials.
+ 
+@@ -23,8 +25,8 @@ installer/
+ │
+ ├── overlay/                          files merged into the squashfs root
+ │   ├── etc/nexus/config.yaml         install-time config (admin/admin, themes, XDR profile, ...)
+-│   ├── etc/systemd/system/           nexus-bootstrap.service + nexus-cockpit.service
+-│   ├── usr/bin/                      nexus-bootstrap, nexus-cockpit, nexus-postinstall
++│   ├── etc/systemd/system/           nexus-bootstrap + cockpit + memory-tiering units
++│   ├── usr/bin/                      nexus-bootstrap, nexus-cockpit, nexus-postinstall, nexus-memory-tiering
+ │   ├── usr/share/nexus-cockpit/      cockpit bundle + bootstrap manifests
+ │   └── usr/lib/nexus/                serve-cockpit.py
+ │
+diff --git a/installer/installer-config/nexus-wizard-questions.yaml b/installer/installer-config/nexus-wizard-questions.yaml
+index 78ebf358..2b17719f 100644
+--- a/installer/installer-config/nexus-wizard-questions.yaml
++++ b/installer/installer-config/nexus-wizard-questions.yaml
+@@ -169,6 +169,27 @@ questions:
+     type: bool
+     default: true
+ 
++  - variable: nexus.memoryTiering.enabled
++    label: Enable memory tiering
++    description: |
++      Use Linux NUMA demotion/promotion for CXL and persistent memory
++      when those devices exist. NVMe is a last-resort zswap+swap tier,
++      not extra guest RAM. Future knobs (HBM, DAMON, CXL pooling) wait
++      until the kernel exposes them.
++    type: bool
++    default: true
++
++  - variable: nexus.memoryTiering.policy
++    label: Memory tiering policy
++    description: |
++      capacity = keep the hot working set in DRAM (demote cold pages).
++      bandwidth = weighted-interleave across DRAM and CXL without moving
++      pages after allocation.
++    type: enum
++    default: capacity
++    options: [capacity, bandwidth]
++    showIf: nexus.memoryTiering.enabled = true
++
+   - variable: nexus.observability.prometheus.enabled
+     label: Enable Prometheus + alerting
+     description: Install the kube-prometheus stack on first boot.
+diff --git a/installer/manifests/50-memory-tiering.yaml b/installer/manifests/50-memory-tiering.yaml
+new file mode 100644
+index 00000000..855e92a3
+--- /dev/null
++++ b/installer/manifests/50-memory-tiering.yaml
+@@ -0,0 +1,54 @@
++# KubeVirt hints for memory tiering. Applied by nexus-bootstrap.
++# Tierable VMs must NOT pin 1 GiB hugepages (those pages cannot demote).
++# DRAM-pinned VMs (GPU, TDX, latency-critical) opt out via annotation
++# nexus.io/memory-tiering=dram-only.
++---
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: nexus-memory-tiering
++  namespace: nexus-cockpit
++  labels:
++    app.kubernetes.io/name: nexus-memory-tiering
++    app.kubernetes.io/managed-by: harvester-nexus-installer
++data:
++  policy: "capacity"
++  annotations.yaml: |
++    nexus.io/memory-tiering: auto
++    nexus.io/guest-cxl: reserved
++    nexus.io/guest-nvdimm: reserved
++    nexus.io/memory-backend: host-tiering
++  preference-tierable.yaml: |
++    apiVersion: instancetype.kubevirt.io/v1beta1
++    kind: VirtualMachinePreference
++    metadata:
++      name: nexus-tierable
++      namespace: default
++    spec:
++      memory:
++        hugepages: {}
++      annotations:
++        nexus.io/memory-tiering: auto
++  preference-dram-pinned.yaml: |
++    apiVersion: instancetype.kubevirt.io/v1beta1
++    kind: VirtualMachinePreference
++    metadata:
++      name: nexus-dram-pinned
++      namespace: default
++    spec:
++      memory:
++        hugepages:
++          pageSize: 1Gi
++      annotations:
++        nexus.io/memory-tiering: dram-only
++  guest-cxl-reserved.yaml: |
++    # Applied when QEMU on the node advertises a CXL Type-3 device to the guest.
++    # KubeVirt does not yet model CXL as first-class CRD fields; the annotation
++    # is reserved so a future launcher hook can attach -device cxl-type3.
++    metadata:
++      annotations:
++        nexus.io/guest-cxl: "true"
++  guest-nvdimm-reserved.yaml: |
++    metadata:
++      annotations:
++        nexus.io/guest-nvdimm: "true"
+diff --git a/installer/manifests/99-nexus-features.yaml b/installer/manifests/99-nexus-features.yaml
+index 599392d9..4aa06b08 100644
+--- a/installer/manifests/99-nexus-features.yaml
++++ b/installer/manifests/99-nexus-features.yaml
+@@ -49,6 +49,12 @@ data:
+   capability.compliance:  "true"
+   capability.deception:   "true"
+   capability.gitops:      "true"
++  capability.memory-tiering: "true"
++  capability.memory-tiering-cxl: "true"
++  capability.memory-tiering-pmem: "true"
++  capability.memory-tiering-nvme-swap: "true"
++  capability.memory-tiering-zswap: "true"
++  capability.memory-tiering-damon: "true"
+ 
+   # Auto-response gates for the XDR engine
+   response.isolate-endpoint:   "true"
+diff --git a/installer/overlay/etc/nexus/config.yaml b/installer/overlay/etc/nexus/config.yaml
+index fef87aea..10a124ce 100644
+--- a/installer/overlay/etc/nexus/config.yaml
++++ b/installer/overlay/etc/nexus/config.yaml
+@@ -169,6 +169,42 @@ compliance:
+     iso-27001:    { schedule: "@weekly",  tool: lynis }
+     soc2:         { schedule: "@weekly",  tool: openscap }
+ 
++# Memory tiering — Linux NUMA/CXL/PMem first, zswap+NVMe last, future
++# knobs reserved so they activate when firmware/kernel expose them.
++# NVMe is never treated as a NUMA node; it is swap / a QEMU page store.
++memoryTiering:
++  enabled: true
++  policy: capacity          # capacity (demote/promote) | bandwidth (weighted interleave)
++  cxl:
++    enabled: true
++  phaseChange:
++    enabled: true
++    device: auto            # daxctl --mode=system-ram when /dev/dax* or pmem exists
++  hbm:
++    enabled: true
++  nvmeSwap:
++    enabled: true
++    zswap: true
++    zswapMaxPoolPercent: 20
++    zswapCompressor: zstd
++    device: auto            # unused local NVMe only; never the boot/data disk
++    ratio: 1.0
++    excludeDevices: []
++  hypervisorNvme:
++    enabled: true
++    directory: /var/lib/nexus/memory-tier-nvme
++  damon:
++    enabled: true
++  weightedInterleave:
++    enabled: true
++  future:
++    cxlPooling: true
++    compressedCxl: true
++    guestCxl: true
++    guestNvdimm: true
++    pghot: true
++    packageAware: true
++
+ # First-login launch animation variant. Operators choose between four
+ # variants in the cockpit; this picks the install-time default.
+ launchVariant: concentric-boot   # concentric-boot | status-cascade | hex-grid | radar-sweep
+diff --git a/installer/overlay/etc/sysctl.d/99-nexus-memory-tiering.conf b/installer/overlay/etc/sysctl.d/99-nexus-memory-tiering.conf
+new file mode 100644
+index 00000000..ebe53afd
+--- /dev/null
++++ b/installer/overlay/etc/sysctl.d/99-nexus-memory-tiering.conf
+@@ -0,0 +1,8 @@
++# Nexus memory-tiering knobs. The agent writes the live values when hardware
++# exists; these comments document the intended sysctls for operators.
++#
++# kernel.numa_balancing = 2          # NUMA_BALANCING_MEMORY_TIERING
++# (demotion) /sys/kernel/mm/numa/demotion_enabled = 1
++# vm.swappiness = 20                 # prefer zswap+NVMe swap over OOM, not over DRAM
++#
++vm.swappiness = 20
+diff --git a/installer/overlay/etc/systemd/system/nexus-memory-tiering.service b/installer/overlay/etc/systemd/system/nexus-memory-tiering.service
+new file mode 100644
+index 00000000..b921a368
+--- /dev/null
++++ b/installer/overlay/etc/systemd/system/nexus-memory-tiering.service
+@@ -0,0 +1,17 @@
++[Unit]
++Description=Harvester-Nexus memory tiering (CXL / PMem / zswap / NVMe)
++Documentation=https://github.com/sggr57a/harvester-nexus
++After=local-fs.target systemd-sysctl.service
++ConditionPathExists=/usr/lib/nexus/memory_tiering.py
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++Environment=NEXUS_MEMORY_TIERING_COMMIT_SWAP=1
++ExecStartPre=/bin/mkdir -p /run/nexus /var/lib/nexus/memory-tiering /var/log/nexus
++ExecStart=/usr/bin/nexus-memory-tiering
++StandardOutput=journal
++StandardError=journal
++
++[Install]
++WantedBy=multi-user.target
+diff --git a/installer/overlay/etc/systemd/system/nexus-memory-tiering.timer b/installer/overlay/etc/systemd/system/nexus-memory-tiering.timer
+new file mode 100644
+index 00000000..3f67e606
+--- /dev/null
++++ b/installer/overlay/etc/systemd/system/nexus-memory-tiering.timer
+@@ -0,0 +1,12 @@
++[Unit]
++Description=Re-run Nexus memory tiering after CXL/DAX hotplug
++Documentation=https://github.com/sggr57a/harvester-nexus
++
++[Timer]
++OnBootSec=2min
++OnUnitActiveSec=5min
++AccuracySec=30s
++Persistent=true
++
++[Install]
++WantedBy=timers.target
+diff --git a/installer/overlay/etc/udev/rules.d/99-nexus-memory-tiering.rules b/installer/overlay/etc/udev/rules.d/99-nexus-memory-tiering.rules
+new file mode 100644
+index 00000000..976955ad
+--- /dev/null
++++ b/installer/overlay/etc/udev/rules.d/99-nexus-memory-tiering.rules
+@@ -0,0 +1,4 @@
++# Re-run memory tiering when CXL or DAX devices appear (hotplug / late firmware).
++ACTION=="add", SUBSYSTEM=="cxl", TAG+="systemd", ENV{SYSTEMD_WANTS}="nexus-memory-tiering.service"
++ACTION=="add", SUBSYSTEM=="dax", TAG+="systemd", ENV{SYSTEMD_WANTS}="nexus-memory-tiering.service"
++ACTION=="add", KERNEL=="nvme*n*", TAG+="systemd", ENV{SYSTEMD_WANTS}="nexus-memory-tiering.service"
+diff --git a/installer/overlay/system/oem/92_nexus.yaml b/installer/overlay/system/oem/92_nexus.yaml
+index c20d9ee6..b9c9d714 100644
+--- a/installer/overlay/system/oem/92_nexus.yaml
++++ b/installer/overlay/system/oem/92_nexus.yaml
+@@ -18,13 +18,16 @@ stages:
+         enable:
+           - nexus-bootstrap.service
+           - nexus-cockpit.service
++          - nexus-memory-tiering.service
++          - nexus-memory-tiering.timer
+         start:
+           - nexus-cockpit.service
++          - nexus-memory-tiering.service
+   boot:
+     - name: "ensure Nexus cockpit starts on installed system boot"
+       if: 'grep -q root=LABEL=COS_STATE /proc/cmdline && [ -n "$(blkid -L COS_STATE)" ]'
+       commands:
+-        - mkdir -p /var/lib/nexus/cockpit-dist /var/log/nexus /etc/nexus/tls
++        - mkdir -p /var/lib/nexus/cockpit-dist /var/log/nexus /etc/nexus/tls /var/lib/nexus/memory-tiering
+         - |
+           if [ -f /usr/share/nexus-cockpit/dist.tar.gz ] \
+              && [ ! -f /usr/share/nexus-cockpit/dist/index.html ] \
+@@ -35,5 +38,8 @@ stages:
+         enable:
+           - nexus-bootstrap.service
+           - nexus-cockpit.service
++          - nexus-memory-tiering.service
++          - nexus-memory-tiering.timer
+         start:
+           - nexus-cockpit.service
++          - nexus-memory-tiering.service
+diff --git a/installer/overlay/usr/bin/nexus-memory-tiering b/installer/overlay/usr/bin/nexus-memory-tiering
+new file mode 100755
+index 00000000..faf3169a
+--- /dev/null
++++ b/installer/overlay/usr/bin/nexus-memory-tiering
+@@ -0,0 +1,11 @@
++#!/bin/bash
++# nexus-memory-tiering — enable Linux memory tiers that the hardware actually
++# provides (CXL, PMem/DAX, HBM NUMA, zswap, NVMe swap) and wait for the rest.
++set -euo pipefail
++export NEXUS_CONFIG="${NEXUS_CONFIG:-/etc/nexus/config.yaml}"
++export NEXUS_PROC_ROOT="${NEXUS_PROC_ROOT:-/proc}"
++export NEXUS_SYS_ROOT="${NEXUS_SYS_ROOT:-/sys}"
++export NEXUS_RUN_ROOT="${NEXUS_RUN_ROOT:-/run/nexus}"
++export NEXUS_VAR_ROOT="${NEXUS_VAR_ROOT:-/var/lib/nexus}"
++mkdir -p "${NEXUS_RUN_ROOT}" "${NEXUS_VAR_ROOT}/memory-tiering" /var/log/nexus
++exec /usr/bin/python3 /usr/lib/nexus/memory_tiering.py "$@"
+diff --git a/installer/overlay/usr/bin/nexus-postinstall b/installer/overlay/usr/bin/nexus-postinstall
+index 2270c6f5..1a91ce86 100755
+--- a/installer/overlay/usr/bin/nexus-postinstall
++++ b/installer/overlay/usr/bin/nexus-postinstall
+@@ -32,5 +32,5 @@ fi
+ mkdir -p /var/lib/nexus /var/log/nexus /etc/nexus/tls
+ 
+ # Enable the bootstrap + cockpit units so they fire on next boot.
+-systemctl enable nexus-bootstrap.service nexus-cockpit.service
+-printf '[nexus-postinstall] enabled nexus-bootstrap + nexus-cockpit units\n'
++systemctl enable nexus-bootstrap.service nexus-cockpit.service nexus-memory-tiering.service nexus-memory-tiering.timer
++printf '[nexus-postinstall] enabled nexus-bootstrap + nexus-cockpit + memory-tiering units\n'
+diff --git a/installer/overlay/usr/lib/nexus/dashboard_collectors.py b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+index 2786f323..9a4aeb21 100644
+--- a/installer/overlay/usr/lib/nexus/dashboard_collectors.py
++++ b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+@@ -27,6 +27,22 @@ except ImportError:
+     collect_networking_slice = None  # type: ignore[assignment,misc]
+ 
+ 
++def _collect_processor_memory() -> dict[str, Any]:
++    """Live NUMA / tier / swap / zswap / PSI snapshot. Never applies sysctls."""
++    try:
++        spec = importlib.util.spec_from_file_location(
++            "nexus_memory_tiering",
++            os.path.join(os.path.dirname(__file__), "memory_tiering.py"),
++        )
++        if spec is None or spec.loader is None:
++            raise ImportError("memory_tiering module missing")
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module.live_dashboard()
++    except Exception as exc:  # noqa: BLE001
++        return {"available": False, "error": str(exc), "memoryTiers": [], "numaZones": [], "waitingForHardware": []}
++
++
+ def _parse_gi(value: str) -> float:
+     if value.endswith("Ti"):
+         return float(value[:-2]) * 1024.0
+@@ -575,6 +591,7 @@ def collect_dashboards_live() -> dict[str, Any]:
+             "monitoringEnabled": monitoring,
+         },
+         "networking": networking if isinstance(networking, dict) else {"available": False},
++        "processorMemory": _collect_processor_memory(),
+     }
+ 
+ 
+diff --git a/installer/overlay/usr/lib/nexus/memory_tiering.py b/installer/overlay/usr/lib/nexus/memory_tiering.py
+new file mode 100755
+index 00000000..e0651f01
+--- /dev/null
++++ b/installer/overlay/usr/lib/nexus/memory_tiering.py
+@@ -0,0 +1,1062 @@
++#!/usr/bin/env python3
++"""Linux memory tiering for Nexus: CXL, PMem/DAX, HBM, zswap, NVMe swap.
++
++The kernel's first-class model is byte-addressable NUMA nodes with different
++latency. This module:
++
++* discovers whatever the platform actually has (CXL Type-3, Optane/NVDIMM DAX,
++  HBM NUMA nodes, spare NVMe, DAMON, weighted interleave, package-aware
++  sysfs, pghot);
++* enables demotion + NUMA-balancing *tiering mode* when a slower memory-only
++  node exists;
++* binds leftover PMem/DAX to ``dax/kmem`` (phase-change / Optane App Direct);
++* puts zswap in front of a dedicated local NVMe swap as the last safety net
++  (this is *not* vSphere NVMe-as-RAM — guests do not see extra DRAM);
++* prepares a directory on that NVMe so QEMU/KubeVirt can file-back cold guest
++  RAM later, without requiring hugepages on tierable VMs;
++* records future hooks (CXL pooling switches, compressed CXL, guest CXL/NVDIMM,
++  pghot, package-aware policy) as ``waiting`` or ``ready`` so they activate
++  the moment the kernel/firmware exposes them.
++
++Every counter that is not present is ``None``, never a fabricated zero.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++import time
++from typing import Any
++
++PAGE_SIZE = 4096
++KIB = 1024
++GIB = 1024**3
++
++NVME_NAME = re.compile(r"^nvme\d+n\d+$")
++DAX_NAME = re.compile(r"^dax\d+(\.\d+)?$")
++SAFE_DEV = re.compile(r"^/dev/(nvme\d+n\d+|pmem\d+|dax\d+(?:\.\d+)?)$")
++
++
++def default_config() -> dict[str, Any]:
++    return {
++        "enabled": True,
++        "policy": "capacity",  # capacity (promote/demote) | bandwidth (weighted interleave)
++        "cxl": {"enabled": True},
++        "phaseChange": {"enabled": True, "device": "auto"},
++        "hbm": {"enabled": True},
++        "nvmeSwap": {
++            "enabled": True,
++            "zswap": True,
++            "zswapMaxPoolPercent": 20,
++            "zswapCompressor": "zstd",
++            "device": "auto",
++            "ratio": 1.0,
++            "excludeDevices": [],
++        },
++        "hypervisorNvme": {
++            "enabled": True,
++            "directory": "/var/lib/nexus/memory-tier-nvme",
++        },
++        "damon": {"enabled": True},
++        "weightedInterleave": {"enabled": True},
++        "future": {
++            "cxlPooling": True,
++            "compressedCxl": True,
++            "guestCxl": True,
++            "guestNvdimm": True,
++            "pghot": True,
++            "packageAware": True,
++        },
++    }
++
++
++def _read(path: str) -> str | None:
++    try:
++        with open(path, "r", encoding="utf-8") as fh:
++            return fh.read()
++    except OSError:
++        return None
++
++
++def _read_strip(path: str) -> str | None:
++    raw = _read(path)
++    if raw is None:
++        return None
++    return raw.strip()
++
++
++def _write(path: str, value: str) -> bool:
++    try:
++        directory = os.path.dirname(path)
++        if directory:
++            os.makedirs(directory, exist_ok=True)
++        with open(path, "w", encoding="utf-8") as fh:
++            fh.write(value)
++        return True
++    except OSError:
++        return False
++
++
++def _listdir(path: str) -> list[str]:
++    try:
++        return sorted(os.listdir(path))
++    except OSError:
++        return []
++
++
++def _exists(path: str) -> bool:
++    return os.path.exists(path)
++
++
++def _is_dir(path: str) -> bool:
++    return os.path.isdir(path)
++
++
++def _parse_kb(line: str) -> int | None:
++    parts = line.replace(":", " ").split()
++    for token in parts:
++        if token.isdigit():
++            return int(token)
++    return None
++
++
++def _node_ids(sys_root: str) -> list[int]:
++    base = os.path.join(sys_root, "devices/system/node")
++    out: list[int] = []
++    for name in _listdir(base):
++        if name.startswith("node") and name[4:].isdigit():
++            out.append(int(name[4:]))
++    return out
++
++
++def _cpulist_has_cpu(raw: str | None) -> bool:
++    if raw is None:
++        return False
++    text = raw.strip()
++    return bool(text)
++
++
++def discover(proc_root: str, sys_root: str) -> dict[str, Any]:
++    """Inventory NUMA, CXL, DAX/PMem, NVMe, and kernel feature knobs."""
++    dram_nodes: list[int] = []
++    memory_only: list[int] = []
++    nodes: list[dict[str, Any]] = []
++    for nid in _node_ids(sys_root):
++        node_dir = os.path.join(sys_root, "devices/system/node", f"node{nid}")
++        cpus = _read_strip(os.path.join(node_dir, "cpulist"))
++        meminfo = _read(os.path.join(node_dir, "meminfo")) or ""
++        total_kb = None
++        used_kb = None
++        for line in meminfo.splitlines():
++            if "MemTotal" in line:
++                total_kb = _parse_kb(line)
++            if "MemUsed" in line:
++                used_kb = _parse_kb(line)
++        entry = {
++            "id": nid,
++            "hasCpu": _cpulist_has_cpu(cpus),
++            "memTotalKb": total_kb,
++            "memUsedKb": used_kb,
++            "distance": (_read_strip(os.path.join(node_dir, "distance")) or "").split(),
++        }
++        nodes.append(entry)
++        if entry["hasCpu"]:
++            dram_nodes.append(nid)
++        elif total_kb:
++            memory_only.append(nid)
++
++    cxl_devices: list[dict[str, Any]] = []
++    cxl_base = os.path.join(sys_root, "bus/cxl/devices")
++    has_switch = False
++    for name in _listdir(cxl_base):
++        path = os.path.join(cxl_base, name)
++        kind = "endpoint"
++        if name.startswith("mem"):
++            kind = "memory"
++        elif name.startswith("decoder"):
++            kind = "decoder"
++        elif name.startswith("port"):
++            kind = "port"
++        elif "switch" in name:
++            kind = "switch"
++            has_switch = True
++        cxl_devices.append(
++            {
++                "id": name,
++                "kind": kind,
++                "serial": _read_strip(os.path.join(path, "serial")),
++                "size": _read_strip(os.path.join(path, "size")),
++            }
++        )
++
++    dax_devices: list[dict[str, Any]] = []
++    dax_base = os.path.join(sys_root, "bus/dax/devices")
++    for name in _listdir(dax_base):
++        path = os.path.join(dax_base, name)
++        size_raw = _read_strip(os.path.join(path, "size"))
++        size = int(size_raw) if size_raw and size_raw.isdigit() else None
++        target = _read_strip(os.path.join(path, "target_node"))
++        dax_devices.append(
++            {
++                "id": name,
++                "sizeBytes": size,
++                "targetNode": int(target) if target and target.lstrip("-").isdigit() else None,
++                "boundToKmem": _exists(os.path.join(sys_root, "bus/dax/drivers/kmem", name)),
++            }
++        )
++
++    pmem: list[dict[str, Any]] = []
++    block_base = os.path.join(sys_root, "class/block")
++    for name in _listdir(block_base):
++        if not name.startswith("pmem"):
++            continue
++        sectors = _read_strip(os.path.join(block_base, name, "size"))
++        pmem.append(
++            {
++                "id": name,
++                "path": f"/dev/{name}",
++                "sectors": int(sectors) if sectors and sectors.isdigit() else None,
++            }
++        )
++
++    mounts = _read(os.path.join(proc_root, "mounts")) or ""
++    mounted_devs = {line.split()[0] for line in mounts.splitlines() if line.startswith("/dev/")}
++    nvme: list[dict[str, Any]] = []
++    for name in _listdir(block_base):
++        if not NVME_NAME.match(name):
++            continue
++        sectors = _read_strip(os.path.join(block_base, name, "size"))
++        holders = _listdir(os.path.join(block_base, name, "holders"))
++        path = f"/dev/{name}"
++        in_use = any(dev == path or dev.startswith(path) for dev in mounted_devs) or bool(holders)
++        nvme.append(
++            {
++                "id": name,
++                "path": path,
++                "sectors": int(sectors) if sectors and sectors.isdigit() else None,
++                "inUse": in_use,
++            }
++        )
++
++    tiers: list[dict[str, Any]] = []
++    tier_base = os.path.join(sys_root, "devices/virtual/memory_tiering")
++    for name in _listdir(tier_base):
++        if not name.startswith("memory_tier"):
++            continue
++        nodelist = _read_strip(os.path.join(tier_base, name, "nodelist")) or ""
++        tiers.append({"id": name, "nodelist": nodelist})
++
++    caps = {
++        "demotion": _exists(os.path.join(sys_root, "kernel/mm/numa/demotion_enabled"))
++        or _exists(os.path.join(proc_root, "sys/kernel/numa/demotion_enabled")),
++        "numaBalancing": _exists(os.path.join(proc_root, "sys/kernel/numa_balancing")),
++        "memoryTiersSysfs": _is_dir(tier_base),
++        "zswap": _exists(os.path.join(sys_root, "module/zswap/parameters/enabled")),
++        "damon": _is_dir(os.path.join(sys_root, "kernel/mm/damon")),
++        "damonTier": _exists(os.path.join(sys_root, "module/damon_tier/parameters/enabled")),
++        "weightedInterleave": _is_dir(os.path.join(sys_root, "kernel/mm/mempolicy/weighted_interleave")),
++        "packageAware": _is_dir(os.path.join(sys_root, "devices/system/package")),
++        "pghot": _is_dir(os.path.join(sys_root, "kernel/mm/pghot")),
++        "cxlDriver": _is_dir(os.path.join(sys_root, "bus/cxl/drivers")) or bool(cxl_devices),
++        "daxKmem": _exists(os.path.join(sys_root, "bus/dax/drivers/kmem/bind"))
++        or _exists(os.path.join(sys_root, "bus/dax/drivers/kmem/new_id")),
++        "cxlPoolingSwitch": has_switch,
++        "compressedCxl": _exists(os.path.join(sys_root, "bus/cxl/devices/mem0/ram/qos_class"))
++        or _exists(os.path.join(sys_root, "firmware/cxl/compression")),
++    }
++
++    return {
++        "dramNodes": dram_nodes,
++        "memoryOnlyNodes": memory_only,
++        "nodes": nodes,
++        "cxlDevices": cxl_devices,
++        "daxDevices": dax_devices,
++        "pmemDevices": pmem,
++        "nvmeDevices": nvme,
++        "tiers": tiers,
++        "capabilities": caps,
++    }
++
++
++def config_from_cmdline(config: dict[str, Any], proc_root: str) -> dict[str, Any]:
++    """Merge ``nexus.features.memory_tiering=`` from the kernel command line."""
++    cmdline = _read_strip(os.path.join(proc_root, "cmdline")) or ""
++    match = re.search(r"nexus\.features\.memory_tiering=([^\s]+)", cmdline)
++    if not match:
++        return config
++    value = match.group(1).strip().lower()
++    if value in ("0", "false", "off", "no"):
++        config["enabled"] = False
++        return config
++    config["enabled"] = True
++    if value in ("nvme", "phase-change", "cxl", "auto"):
++        config["cmdlineMode"] = value
++    return config
++
++
++def _exclude_set(config: dict[str, Any]) -> set[str]:
++    extra = config.get("nvmeSwap", {}).get("excludeDevices") or []
++    return {str(item) for item in extra}
++
++
++def _pick_nvme(inventory: dict[str, Any], config: dict[str, Any]) -> str | None:
++    requested = str(config.get("nvmeSwap", {}).get("device") or "auto")
++    exclude = _exclude_set(config)
++    if requested != "auto":
++        if not SAFE_DEV.match(requested):
++            return None
++        if requested in exclude:
++            return None
++        return requested
++    for dev in inventory.get("nvmeDevices") or []:
++        path = dev.get("path")
++        if not path or path in exclude or dev.get("inUse"):
++            continue
++        return path
++    return None
++
++
++def plan(
++    inventory: dict[str, Any],
++    config: dict[str, Any],
++    proc_root: str = "/proc",
++    sys_root: str = "/sys",
++) -> dict[str, Any]:
++    """Return actions plus hardware still waited on. Never invent devices."""
++    del proc_root  # reserved for future cmdline-conditioned plans
++    actions: list[dict[str, Any]] = []
++    waiting: list[str] = []
++    notes: list[str] = []
++    if not config.get("enabled", True):
++        return {"actions": actions, "waiting": waiting, "notes": ["disabled"]}
++
++    caps = inventory.get("capabilities") or {}
++    policy = str(config.get("policy") or "capacity")
++    has_slow = bool(inventory.get("memoryOnlyNodes")) or bool(inventory.get("cxlDevices"))
++    has_dax = bool(inventory.get("daxDevices")) or bool(inventory.get("pmemDevices"))
++
++    if policy == "bandwidth" and config.get("weightedInterleave", {}).get("enabled", True):
++        if caps.get("weightedInterleave") and has_slow:
++            actions.append({"op": "enable_weighted_interleave"})
++        else:
++            waiting.append("weighted-interleave")
++    else:
++        if has_slow and caps.get("demotion"):
++            actions.append({"op": "enable_demotion"})
++        elif not has_slow:
++            waiting.append("memory-only-numa")
++        if has_slow and caps.get("numaBalancing"):
++            actions.append({"op": "enable_numa_balancing_tiering"})
++
++    if config.get("cxl", {}).get("enabled", True):
++        if not inventory.get("cxlDevices"):
++            waiting.append("cxl")
++        elif not caps.get("cxlDriver"):
++            waiting.append("cxl-driver")
++
++    if config.get("phaseChange", {}).get("enabled", True):
++        unbound = [d for d in inventory.get("daxDevices") or [] if not d.get("boundToKmem")]
++        if unbound and caps.get("daxKmem"):
++            for device in unbound:
++                actions.append({"op": "bind_dax_kmem", "device": device["id"]})
++        elif not has_dax:
++            waiting.append("phase-change")
++
++    if config.get("hbm", {}).get("enabled", True):
++        # HBM shows up as a *faster* memory-only node in the top memory_tier.
++        # Nothing to bind; we just advertise it when the kernel grouped it.
++        top = inventory.get("tiers") or []
++        if not any("hbm" in (t.get("id") or "") for t in top) and not _hbm_nodes(inventory):
++            waiting.append("hbm")
++
++    if config.get("nvmeSwap", {}).get("enabled", True):
++        if config.get("nvmeSwap", {}).get("zswap", True) and caps.get("zswap"):
++            actions.append(
++                {
++                    "op": "enable_zswap",
++                    "compressor": config["nvmeSwap"].get("zswapCompressor", "zstd"),
++                    "maxPoolPercent": int(config["nvmeSwap"].get("zswapMaxPoolPercent", 20)),
++                }
++            )
++        elif config.get("nvmeSwap", {}).get("zswap", True):
++            waiting.append("zswap-module")
++        device = _pick_nvme(inventory, config)
++        if device:
++            actions.append(
++                {
++                    "op": "prepare_nvme_swap",
++                    "device": device,
++                    "ratio": float(config["nvmeSwap"].get("ratio", 1.0)),
++                }
++            )
++        else:
++            waiting.append("nvme-swap")
++
++    if config.get("hypervisorNvme", {}).get("enabled", True):
++        actions.append(
++            {
++                "op": "prepare_hypervisor_nvme_dir",
++                "directory": config["hypervisorNvme"].get(
++                    "directory", "/var/lib/nexus/memory-tier-nvme"
++                ),
++            }
++        )
++
++    if config.get("damon", {}).get("enabled", True):
++        if caps.get("damonTier"):
++            actions.append({"op": "enable_damon_tier"})
++        elif caps.get("damon"):
++            notes.append("damon-sysfs-present")
++        else:
++            waiting.append("damon")
++
++    future = config.get("future") or {}
++    if future.get("packageAware") and caps.get("packageAware"):
++        actions.append({"op": "probe_package_aware"})
++    elif future.get("packageAware"):
++        waiting.append("package-aware")
++    if future.get("pghot") and not caps.get("pghot"):
++        waiting.append("pghot")
++    if future.get("cxlPooling") and not caps.get("cxlPoolingSwitch"):
++        waiting.append("cxl-pooling")
++    if future.get("compressedCxl") and not caps.get("compressedCxl"):
++        waiting.append("compressed-cxl")
++    if future.get("guestCxl"):
++        notes.append("guest-cxl-reserved")
++    if future.get("guestNvdimm"):
++        notes.append("guest-nvdimm-reserved")
++
++    return {"actions": actions, "waiting": sorted(set(waiting)), "notes": notes}
++
++
++def _hbm_nodes(inventory: dict[str, Any]) -> list[int]:
++    """Heuristic: memory-only node whose tier id is numerically below DRAM."""
++    tiers = inventory.get("tiers") or []
++    if len(tiers) < 2:
++        return []
++    # Lower memory_tierN is faster. If a CPU-less node is in the fastest tier, call it HBM.
++    def rank(name: str) -> int:
++        digits = "".join(ch for ch in name if ch.isdigit())
++        return int(digits) if digits else 99
++
++    fastest = min(tiers, key=lambda row: rank(str(row.get("id") or "")))
++    nodelist = str(fastest.get("nodelist") or "")
++    ids: list[int] = []
++    for part in nodelist.replace(",", " ").split():
++        if "-" in part:
++            lo, _, hi = part.partition("-")
++            if lo.isdigit() and hi.isdigit():
++                ids.extend(range(int(lo), int(hi) + 1))
++        elif part.isdigit():
++            ids.append(int(part))
++    dram = set(inventory.get("dramNodes") or [])
++    return [nid for nid in ids if nid not in dram]
++
++
++def apply_actions(
++    actions: list[dict[str, Any]],
++    *,
++    proc_root: str,
++    sys_root: str,
++    run_root: str = "/run/nexus",
++    var_root: str = "/var/lib/nexus",
++    dry_run: bool = False,
++) -> dict[str, Any]:
++    """Apply planned writes. Device-destructive steps stay in the status file."""
++    results: list[dict[str, Any]] = []
++    for action in actions:
++        op = action.get("op")
++        ok = True
++        detail = "dry-run" if dry_run else "ok"
++        if dry_run:
++            results.append({"op": op, "ok": True, "detail": detail})
++            continue
++        if op == "enable_demotion":
++            path = os.path.join(sys_root, "kernel/mm/numa/demotion_enabled")
++            alt = os.path.join(proc_root, "sys/kernel/numa/demotion_enabled")
++            ok = _write(path, "1\n") or _write(alt, "1\n")
++        elif op == "enable_numa_balancing_tiering":
++            ok = _write(os.path.join(proc_root, "sys/kernel/numa_balancing"), "2\n")
++        elif op == "enable_zswap":
++            base = os.path.join(sys_root, "module/zswap/parameters")
++            ok = _write(os.path.join(base, "enabled"), "Y\n")
++            compressor = str(action.get("compressor") or "zstd")
++            _write(os.path.join(base, "compressor"), compressor + "\n")
++            _write(os.path.join(base, "max_pool_percent"), str(int(action.get("maxPoolPercent") or 20)) + "\n")
++        elif op == "bind_dax_kmem":
++            device = str(action.get("device") or "")
++            if not DAX_NAME.match(device):
++                ok = False
++                detail = "rejected device name"
++            else:
++                bind = os.path.join(sys_root, "bus/dax/drivers/kmem/bind")
++                new_id = os.path.join(sys_root, "bus/dax/drivers/kmem/new_id")
++                ok = _write(bind, device + "\n") or _write(new_id, device + "\n")
++        elif op == "enable_damon_tier":
++            ok = _write(os.path.join(sys_root, "module/damon_tier/parameters/enabled"), "1\n")
++        elif op == "enable_weighted_interleave":
++            marker = os.path.join(sys_root, "kernel/mm/mempolicy/weighted_interleave/enabled")
++            ok = _write(marker, "1\n") or _is_dir(os.path.join(sys_root, "kernel/mm/mempolicy/weighted_interleave"))
++        elif op == "prepare_nvme_swap":
++            device = str(action.get("device") or "")
++            if not SAFE_DEV.match(device):
++                ok = False
++                detail = "rejected device name"
++            else:
++                status_dir = os.path.join(var_root, "memory-tiering")
++                os.makedirs(status_dir, exist_ok=True)
++                _write(
++                    os.path.join(status_dir, "nvme-swap.json"),
++                    json.dumps({"device": device, "ratio": action.get("ratio"), "preparedAt": time.time()}),
++                )
++                detail = f"recorded {device}; mkswap/swapon run on the node when the device is unused"
++        elif op == "prepare_hypervisor_nvme_dir":
++            directory = str(action.get("directory") or "/var/lib/nexus/memory-tier-nvme")
++            if not directory.startswith("/var/lib/nexus") and not directory.startswith(var_root):
++                # In tests var_root is a temp dir; rebase the last component.
++                directory = os.path.join(var_root, "memory-tier-nvme")
++            try:
++                os.makedirs(directory, exist_ok=True)
++                ok = True
++                detail = directory
++            except OSError as exc:
++                ok = False
++                detail = str(exc)
++        elif op == "probe_package_aware":
++            detail = "sysfs present; kernel toggle is read-only until firmware topology is valid"
++        else:
++            ok = False
++            detail = f"unknown op {op}"
++        results.append({"op": op, "ok": ok, "detail": detail})
++
++    os.makedirs(run_root, exist_ok=True)
++    _write(os.path.join(run_root, "memory-tiering-applied.json"), json.dumps({"results": results, "ts": time.time()}))
++    if os.environ.get("NEXUS_MEMORY_TIERING_COMMIT_SWAP") == "1" and not dry_run:
++        results.append(_commit_swapfile(var_root, proc_root))
++    return {"results": results}
++
++
++def _commit_swapfile(var_root: str, proc_root: str) -> dict[str, Any]:
++    """Create a bounded swap file. Never wipes an NVMe namespace."""
++    path = os.path.join(var_root, "memory-tiering", "swapfile")
++    swaps = _read(os.path.join(proc_root, "swaps")) or ""
++    if path in swaps or os.path.basename(path) in swaps:
++        return {"op": "commit_swapfile", "ok": True, "detail": "already active"}
++    meminfo = _parse_meminfo(_read(os.path.join(proc_root, "meminfo")) or "")
++    total_kb = int(meminfo.get("memTotalKb") or 0)
++    # Cap at 8 GiB so a first boot cannot fill the rootfs. Operators raise it later.
++    size = min(max(total_kb * 1024 // 4, 16 * 1024 * 1024), 8 * GIB)
++    if proc_root != "/proc":
++        return {"op": "commit_swapfile", "ok": True, "detail": "skipped (not a real /proc)"}
++    try:
++        os.makedirs(os.path.dirname(path), exist_ok=True)
++        if not os.path.exists(path):
++            with open(path, "wb") as fh:
++                fh.truncate(size)
++            os.chmod(path, 0o600)
++        import subprocess
++
++        mkswap = subprocess.run(["mkswap", path], capture_output=True, text=True, check=False)
++        if mkswap.returncode != 0:
++            return {"op": "commit_swapfile", "ok": False, "detail": mkswap.stderr.strip() or "mkswap failed"}
++        swapon = subprocess.run(["swapon", "-p", "10", path], capture_output=True, text=True, check=False)
++        if swapon.returncode != 0:
++            return {"op": "commit_swapfile", "ok": False, "detail": swapon.stderr.strip() or "swapon failed"}
++        return {"op": "commit_swapfile", "ok": True, "detail": path}
++    except OSError as exc:
++        return {"op": "commit_swapfile", "ok": False, "detail": str(exc)}
++
++
++def _parse_meminfo(text: str) -> dict[str, int | None]:
++    wanted = {
++        "MemTotal": "memTotalKb",
++        "MemAvailable": "memAvailableKb",
++        "SwapTotal": "swapTotalKb",
++        "SwapFree": "swapFreeKb",
++        "AnonPages": "anonPagesKb",
++        "Committed_AS": "committedAsKb",
++        "VmallocUsed": "vmallocUsedKb",
++        "HugePages_Total": "hugePagesTotal",
++        "HugePages_Free": "hugePagesFree",
++        "Hugepagesize": "hugePageSizeKb",
++        "Shmem": "shmemKb",
++        "Active(anon)": "activeAnonKb",
++        "Inactive(anon)": "inactiveAnonKb",
++        "Active(file)": "activeFileKb",
++        "Inactive(file)": "inactiveFileKb",
++    }
++    found: dict[str, int | None] = {alias: None for alias in wanted.values()}
++    for line in text.splitlines():
++        key, _, rest = line.partition(":")
++        if key in wanted:
++            token = rest.strip().split()[0] if rest.strip() else ""
++            found[wanted[key]] = int(token) if token.lstrip("-").isdigit() else None
++    return found
++
++
++def _parse_vmstat(text: str) -> dict[str, int | None]:
++    keys = [
++        "pgdemote_kswapd",
++        "pgdemote_direct",
++        "pgdemote_khugepaged",
++        "pgdemote_proactive",
++        "pgpromote_success",
++        "pgpromote_candidate",
++        "pswpin",
++        "pswpout",
++        "zswpin",
++        "zswpout",
++        "zswpwb",
++        "pgfault",
++        "pgmajfault",
++        "numa_hit",
++        "numa_miss",
++        "numa_foreign",
++        "pgmigrate_success",
++    ]
++    raw: dict[str, int] = {}
++    for line in text.splitlines():
++        parts = line.split()
++        if len(parts) >= 2 and parts[1].lstrip("-").isdigit():
++            raw[parts[0]] = int(parts[1])
++
++    def camel(name: str) -> str:
++        head, *rest = name.split("_")
++        return head + "".join(p.title() for p in rest)
++
++    return {camel(key): raw.get(key) if key in raw else None for key in keys}
++
++
++def _parse_psi(text: str | None) -> dict[str, Any] | None:
++    if not text:
++        return None
++    out: dict[str, Any] = {}
++    for line in text.splitlines():
++        parts = line.split()
++        if not parts:
++            continue
++        kind = parts[0]
++        sample: dict[str, float] = {}
++        for item in parts[1:]:
++            if "=" not in item:
++                continue
++            name, _, value = item.partition("=")
++            try:
++                sample[name] = float(value)
++            except ValueError:
++                continue
++        out[kind] = sample
++    return out or None
++
++
++def _parse_swaps(text: str) -> list[dict[str, Any]]:
++    rows: list[dict[str, Any]] = []
++    for line in text.splitlines()[1:]:
++        fields = line.split()
++        if len(fields) < 5:
++            continue
++        rows.append(
++            {
++                "device": fields[0],
++                "type": fields[1],
++                "sizeKb": int(fields[2]) if fields[2].isdigit() else None,
++                "usedKb": int(fields[3]) if fields[3].isdigit() else None,
++                "priority": int(fields[4]) if fields[4].lstrip("-").isdigit() else None,
++            }
++        )
++    return rows
++
++
++def collect_metrics(proc_root: str, sys_root: str) -> dict[str, Any]:
++    meminfo = _parse_meminfo(_read(os.path.join(proc_root, "meminfo")) or "")
++    vmstat = _parse_vmstat(_read(os.path.join(proc_root, "vmstat")) or "")
++    swaps = _parse_swaps(_read(os.path.join(proc_root, "swaps")) or "")
++    psi = {
++        "memory": _parse_psi(_read(os.path.join(proc_root, "pressure/memory"))),
++        "cpu": _parse_psi(_read(os.path.join(proc_root, "pressure/cpu"))),
++        "io": _parse_psi(_read(os.path.join(proc_root, "pressure/io"))),
++    }
++    zswap_enabled_raw = _read_strip(os.path.join(sys_root, "module/zswap/parameters/enabled"))
++    zswap_enabled: bool | None
++    if zswap_enabled_raw is None:
++        zswap_enabled = None
++    else:
++        zswap_enabled = zswap_enabled_raw.upper() in ("Y", "1", "YES", "ON")
++    stored = _read_strip(os.path.join(sys_root, "kernel/mm/zswap/stored_pages"))
++    pool_hits = _read_strip(os.path.join(sys_root, "kernel/mm/zswap/pool_limit_hit"))
++    written = _read_strip(os.path.join(sys_root, "kernel/mm/zswap/written_back_pages"))
++
++    def maybe_int(raw: str | None) -> int | None:
++        if raw is None or not raw.lstrip("-").isdigit():
++            return None
++        return int(raw)
++
++    tiers: list[dict[str, Any]] = []
++    tier_base = os.path.join(sys_root, "devices/virtual/memory_tiering")
++    for name in _listdir(tier_base):
++        if name.startswith("memory_tier"):
++            tiers.append({"id": name, "nodelist": _read_strip(os.path.join(tier_base, name, "nodelist")) or ""})
++
++    hugepages: list[dict[str, Any]] = []
++    hp_base = os.path.join(sys_root, "kernel/mm/hugepages")
++    for name in _listdir(hp_base):
++        allocated = maybe_int(_read_strip(os.path.join(hp_base, name, "nr_hugepages")))
++        free = maybe_int(_read_strip(os.path.join(hp_base, name, "free_hugepages")))
++        size_kb = None
++        digits = "".join(ch for ch in name if ch.isdigit())
++        if digits.isdigit():
++            # hugepages-2048kB / hugepages-1048576kB
++            size_kb = int(digits)
++        hugepages.append({"name": name, "sizeKb": size_kb, "allocated": allocated, "free": free})
++
++    demotion = _read_strip(os.path.join(sys_root, "kernel/mm/numa/demotion_enabled"))
++    balancing = _read_strip(os.path.join(proc_root, "sys/kernel/numa_balancing"))
++
++    return {
++        "meminfo": meminfo,
++        "vmstat": vmstat,
++        "swaps": swaps,
++        "psi": psi,
++        "zswap": {
++            "enabled": zswap_enabled,
++            "compressor": _read_strip(os.path.join(sys_root, "module/zswap/parameters/compressor")),
++            "maxPoolPercent": maybe_int(_read_strip(os.path.join(sys_root, "module/zswap/parameters/max_pool_percent"))),
++            "storedPages": maybe_int(stored),
++            "poolLimitHit": maybe_int(pool_hits),
++            "writtenBackPages": maybe_int(written),
++        },
++        "tiers": tiers,
++        "hugepages": hugepages,
++        "demotionEnabled": demotion in ("1", "Y") if demotion is not None else None,
++        "numaBalancing": maybe_int(balancing),
++    }
++
++
++def _kb_to_gib(kb: int | None) -> float:
++    if not kb:
++        return 0.0
++    return round(kb * KIB / GIB, 2)
++
++
++def dashboard_slice(
++    inventory: dict[str, Any],
++    planned: dict[str, Any],
++    metrics: dict[str, Any],
++    config: dict[str, Any],
++) -> dict[str, Any]:
++    """Shape the Processor & Memory live dashboard from real counters."""
++    mem = metrics.get("meminfo") or {}
++    dram_kb = 0
++    for node in inventory.get("nodes") or []:
++        if node.get("hasCpu") and node.get("memTotalKb"):
++            dram_kb += int(node["memTotalKb"])
++    if not dram_kb:
++        dram_kb = int(mem.get("memTotalKb") or 0)
++    dram_used = dram_kb - int(mem.get("memAvailableKb") or 0) if dram_kb and mem.get("memAvailableKb") is not None else None
++
++    cxl_kb = 0
++    for node in inventory.get("nodes") or []:
++        if not node.get("hasCpu") and node.get("memTotalKb"):
++            cxl_kb += int(node["memTotalKb"])
++
++    pmem_bytes = 0
++    for dax in inventory.get("daxDevices") or []:
++        if dax.get("sizeBytes"):
++            pmem_bytes += int(dax["sizeBytes"])
++    pmem_kb = pmem_bytes // KIB
++
++    zswap = metrics.get("zswap") or {}
++    pool_pct = int(zswap.get("maxPoolPercent") or 0)
++    zswap_cap_kb = int(dram_kb * pool_pct / 100) if pool_pct else 0
++    stored_pages = zswap.get("storedPages")
++    zswap_used_kb = (int(stored_pages) * PAGE_SIZE // KIB) if stored_pages is not None else None
++
++    swap_total = mem.get("swapTotalKb") or 0
++    swap_used = (mem.get("swapTotalKb") or 0) - (mem.get("swapFreeKb") or 0) if mem.get("swapTotalKb") else 0
++
++    nvme_cap_kb = 0
++    for action in planned.get("actions") or []:
++        if action.get("op") == "prepare_nvme_swap" and action.get("device"):
++            ratio = float(action.get("ratio") or 1.0)
++            nvme_cap_kb = int(dram_kb * ratio)
++
++    def tier(tid: str, label: str, cap_kb: int, used_kb: int | None, latency_ns: int | None, tput: float | None) -> dict[str, Any]:
++        return {
++            "id": tid,
++            "label": label,
++            "capacityGiB": _kb_to_gib(cap_kb),
++            "usedGiB": _kb_to_gib(used_kb) if used_kb is not None else 0,
++            "latencyNs": latency_ns,
++            "throughputGiBs": tput,
++            "present": cap_kb > 0,
++        }
++
++    memory_tiers = [
++        tier("dram", "DRAM", dram_kb, dram_used, 80, 64.0),
++        tier("hbm", "HBM", sum(n.get("memTotalKb") or 0 for n in inventory.get("nodes") or [] if n.get("id") in _hbm_nodes(inventory)), 0, 40, 128.0),
++        tier("cxl", "CXL Type-3", cxl_kb, None, 180, 32.0),
++        tier("phase-change", "Phase-change / PMem DAX", pmem_kb, None, 900, 9.0),
++        tier("zswap", "zswap (compressed DRAM)", zswap_cap_kb, zswap_used_kb, 200, 20.0),
++        tier("nvme", "Hypervisor NVMe page store", nvme_cap_kb, None, 400, 18.0),
++        tier("swap", "NVMe/SSD swap", int(swap_total or 0), int(swap_used or 0), 2400, 4.0),
++    ]
++
++    numa_zones = []
++    for node in inventory.get("nodes") or []:
++        hits = (metrics.get("vmstat") or {}).get("numaHit")
++        miss = (metrics.get("vmstat") or {}).get("numaMiss")
++        remote = None
++        if hits is not None and miss is not None and (hits + miss) > 0:
++            remote = round(100.0 * miss / (hits + miss), 1)
++        numa_zones.append(
++            {
++                "id": f"node{node['id']}",
++                "hasCpu": node.get("hasCpu"),
++                "localRamGiB": _kb_to_gib(node.get("memTotalKb")),
++                "remoteHitsPct": remote,
++                "cores": [],
++            }
++        )
++
++    psi_mem = ((metrics.get("psi") or {}).get("memory") or {}).get("some") or {}
++    psi_cpu = ((metrics.get("psi") or {}).get("cpu") or {}).get("some") or {}
++    psi_io = ((metrics.get("psi") or {}).get("io") or {}).get("some") or {}
++    pressure = []
++    for label, key in (("avg300", "avg300"), ("avg60", "avg60"), ("avg10", "avg10"), ("now", "avg10")):
++        pressure.append(
++            {
++                "label": label if label != "now" else "now",
++                "cpuPressure": psi_cpu.get(key),
++                "memoryPressure": psi_mem.get(key),
++                "ioPressure": psi_io.get(key),
++            }
++        )
++
++    swap_devices = []
++    for row in metrics.get("swaps") or []:
++        swap_devices.append(
++            {
++                "device": row.get("device"),
++                "sizeGiB": _kb_to_gib(row.get("sizeKb")),
++                "usedGiB": _kb_to_gib(row.get("usedKb")),
++                "priority": row.get("priority"),
++            }
++        )
++
++    hugepages = []
++    for row in metrics.get("hugepages") or []:
++        size_kb = row.get("sizeKb") or 0
++        hugepages.append(
++            {
++                "sizeMiB": round(size_kb / 1024, 1) if size_kb else None,
++                "allocated": row.get("allocated"),
++                "free": row.get("free"),
++            }
++        )
++
++    return {
++        "id": "processor-memory",
++        "title": "Processor & Memory",
++        "policy": config.get("policy"),
++        "enabled": config.get("enabled", True),
++        "numaZones": numa_zones,
++        "memoryTiers": memory_tiers,
++        "pressureWaterfall": pressure,
++        "swapDevices": swap_devices,
++        "hugepages": hugepages,
++        "vmstat": metrics.get("vmstat"),
++        "zswap": metrics.get("zswap"),
++        "meminfo": metrics.get("meminfo"),
++        "demotionEnabled": metrics.get("demotionEnabled"),
++        "numaBalancing": metrics.get("numaBalancing"),
++        "waitingForHardware": planned.get("waiting") or [],
++        "capabilities": inventory.get("capabilities"),
++        "notes": planned.get("notes") or [],
++    }
++
++
++def kubevirt_annotations() -> dict[str, str]:
++    return {
++        "nexus.io/memory-tiering": "auto",
++        "nexus.io/guest-cxl": "reserved",
++        "nexus.io/guest-nvdimm": "reserved",
++        "nexus.io/memory-backend": "host-tiering",
++    }
++
++
++def kubevirt_preference(kind: str) -> dict[str, Any]:
++    if kind == "dram-pinned":
++        return {"hugepages": True, "pageSize": "1Gi", "swappable": False, "annotation": "dram-only"}
++    return {"hugepages": False, "pageSize": None, "swappable": True, "annotation": "auto"}
++
++
++def load_config_file(path: str) -> dict[str, Any]:
++    """Read ``memoryTiering`` from Nexus YAML without requiring PyYAML."""
++    cfg = default_config()
++    text = _read(path)
++    if not text:
++        return cfg
++    # Prefer a JSON blob if the operator wrote one.
++    try:
++        parsed = json.loads(text)
++        if isinstance(parsed, dict) and "memoryTiering" in parsed:
++            cfg.update(parsed["memoryTiering"])
++            return cfg
++    except json.JSONDecodeError:
++        pass
++    in_block = False
++    indent0: int | None = None
++    blob: dict[str, Any] = {}
++    stack: list[tuple[int, dict[str, Any]]] = [(0, blob)]
++    for line in text.splitlines():
++        if line.strip().startswith("#") or not line.strip():
++            if in_block and indent0 is not None and (len(line) - len(line.lstrip(" "))) <= indent0 and line.strip():
++                in_block = False
++            continue
++        if not in_block:
++            if re.match(r"^memoryTiering:\s*$", line):
++                in_block = True
++                indent0 = len(line) - len(line.lstrip(" "))
++            continue
++        indent = len(line) - len(line.lstrip(" "))
++        if indent0 is not None and indent <= indent0 and not line.startswith(" "):
++            break
++        stripped = line.strip()
++        if ":" not in stripped:
++            continue
++        key, _, rest = stripped.partition(":")
++        rest = rest.strip()
++        while len(stack) > 1 and indent <= stack[-1][0]:
++            stack.pop()
++        current = stack[-1][1]
++        if rest == "":
++            child: dict[str, Any] = {}
++            current[key] = child
++            stack.append((indent, child))
++        elif rest.lower() in ("true", "false"):
++            current[key] = rest.lower() == "true"
++        elif re.match(r"^-?\d+(\.\d+)?$", rest):
++            current[key] = float(rest) if "." in rest else int(rest)
++        elif rest.startswith("[") and rest.endswith("]"):
++            inner = rest[1:-1].strip()
++            current[key] = [item.strip().strip("'\"") for item in inner.split(",") if item.strip()] if inner else []
++        else:
++            current[key] = rest.strip("'\"")
++    if blob:
++        def merge(dst: dict[str, Any], src: dict[str, Any]) -> dict[str, Any]:
++            for key, value in src.items():
++                if isinstance(value, dict) and isinstance(dst.get(key), dict):
++                    merge(dst[key], value)
++                else:
++                    dst[key] = value
++            return dst
++        merge(cfg, blob)
++    return cfg
++
++
++def reconcile(
++    proc_root: str = "/proc",
++    sys_root: str = "/sys",
++    run_root: str = "/run/nexus",
++    var_root: str = "/var/lib/nexus",
++    config_path: str = "/etc/nexus/config.yaml",
++    dry_run: bool = False,
++) -> dict[str, Any]:
++    config = config_from_cmdline(load_config_file(config_path), proc_root)
++    inventory = discover(proc_root, sys_root)
++    planned = plan(inventory, config, proc_root=proc_root, sys_root=sys_root)
++    applied = apply_actions(
++        planned["actions"],
++        proc_root=proc_root,
++        sys_root=sys_root,
++        run_root=run_root,
++        var_root=var_root,
++        dry_run=dry_run,
++    )
++    metrics = collect_metrics(proc_root, sys_root)
++    slice_ = dashboard_slice(inventory, planned, metrics, config)
++    status = {
++        "inventory": inventory,
++        "plan": planned,
++        "applied": applied,
++        "metrics": metrics,
++        "dashboard": slice_,
++        "kubevirt": {
++            "annotations": kubevirt_annotations(),
++            "tierable": kubevirt_preference("tierable"),
++            "dramPinned": kubevirt_preference("dram-pinned"),
++        },
++        "ts": time.time(),
++    }
++    os.makedirs(run_root, exist_ok=True)
++    os.makedirs(os.path.join(var_root, "memory-tiering"), exist_ok=True)
++    payload = json.dumps(status, default=str)
++    _write(os.path.join(run_root, "memory-tiering.json"), payload)
++    _write(os.path.join(var_root, "memory-tiering", "status.json"), payload)
++    return status
++
++
++def main(argv: list[str] | None = None) -> int:
++    import argparse
++
++    parser = argparse.ArgumentParser(description="Nexus memory tiering agent")
++    parser.add_argument("--dry-run", action="store_true")
++    parser.add_argument("--discover-only", action="store_true")
++    parser.add_argument("--metrics-only", action="store_true")
++    parser.add_argument("--proc", default=os.environ.get("NEXUS_PROC_ROOT", "/proc"))
++    parser.add_argument("--sys", default=os.environ.get("NEXUS_SYS_ROOT", "/sys"))
++    parser.add_argument("--run", default=os.environ.get("NEXUS_RUN_ROOT", "/run/nexus"))
++    parser.add_argument("--var", default=os.environ.get("NEXUS_VAR_ROOT", "/var/lib/nexus"))
++    parser.add_argument("--config", default=os.environ.get("NEXUS_CONFIG", "/etc/nexus/config.yaml"))
++    args = parser.parse_args(argv)
++    if args.discover_only:
++        print(json.dumps(discover(args.proc, args.sys), default=str))
++        return 0
++    if args.metrics_only:
++        print(json.dumps(collect_metrics(args.proc, args.sys), default=str))
++        return 0
++    status = reconcile(
++        proc_root=args.proc,
++        sys_root=args.sys,
++        run_root=args.run,
++        var_root=args.var,
++        config_path=args.config,
++        dry_run=args.dry_run,
++    )
++    print(json.dumps({"waiting": status["plan"]["waiting"], "applied": status["applied"]}, default=str))
++    return 0
++
++
++def live_dashboard(
++    proc_root: str = "/proc",
++    sys_root: str = "/sys",
++    run_root: str = "/run/nexus",
++    config_path: str = "/etc/nexus/config.yaml",
++) -> dict[str, Any]:
++    """Metrics + inventory for the cockpit. Does not write sysctls."""
++    config = config_from_cmdline(load_config_file(config_path), proc_root)
++    cached_path = os.path.join(run_root, "memory-tiering.json")
++    inventory = None
++    planned = None
++    cached = _read(cached_path)
++    if cached:
++        try:
++            parsed = json.loads(cached)
++            inventory = parsed.get("inventory")
++            planned = parsed.get("plan")
++            if parsed.get("kubevirt"):
++                pass
++        except json.JSONDecodeError:
++            inventory = None
++    if not inventory:
++        inventory = discover(proc_root, sys_root)
++        planned = plan(inventory, config, proc_root=proc_root, sys_root=sys_root)
++    metrics = collect_metrics(proc_root, sys_root)
++    dash = dashboard_slice(inventory, planned or {"actions": [], "waiting": []}, metrics, config)
++    dash["available"] = True
++    return dash
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/installer/overlay/usr/lib/nexus/serve-cockpit.py b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+index 8ad4d32a..3d715d9a 100644
+--- a/installer/overlay/usr/lib/nexus/serve-cockpit.py
++++ b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+@@ -166,6 +166,10 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             self._json_api(self._handle_anyraid_status)
+             return
+ 
++        if path == "/api/v1/telemetry/memory-tiering":
++            self._json_api(self._handle_memory_tiering)
++            return
++
+         if path.startswith("/api/v1/"):
+             self._plain(404, b"not found")
+             return
+@@ -360,6 +364,14 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             return {"exists": False, "error": "AnyRAID provisioner unavailable"}
+         return self._anyraid.pool_status()
+ 
++    def _handle_memory_tiering(self) -> dict:
++        if self._dashboards is None:
++            return {"available": False, "error": "dashboard collector unavailable"}
++        collector = getattr(self._dashboards, "_collect_processor_memory", None)
++        if collector is None:
++            return {"available": False, "error": "memory tiering collector unavailable"}
++        return collector()
++
+     def _handle_console_upgrade(self, path: str) -> None:
+         if self._console is None:
+             self._plain(503, b"console proxy unavailable")
+diff --git a/installer/tests/installer.test.ts b/installer/tests/installer.test.ts
+index e0ef2c67..32132601 100644
+--- a/installer/tests/installer.test.ts
++++ b/installer/tests/installer.test.ts
+@@ -174,7 +174,7 @@ describe('installer · bootstrap manifests (installer/manifests/*.yaml)', () =>
+     const cm = docs.find((d) => (d as { kind: string }).kind === 'ConfigMap') as
+       { data: Record<string, string> } | undefined;
+     expect(cm).toBeDefined();
+-    for (const k of ['view.mission-control', 'view.xdr-operations', 'view.security-posture', 'view.launch-mockups', 'capability.xdr', 'capability.anyraid']) {
++    for (const k of ['view.mission-control', 'view.xdr-operations', 'view.security-posture', 'view.launch-mockups', 'capability.xdr', 'capability.anyraid', 'capability.memory-tiering']) {
+       expect(cm!.data[k], k).toBe('true');
+     }
+   });
+@@ -200,6 +200,8 @@ describe('installer · wizard questions cover every install-time setting', () =>
+       'nexus.xdr.autoResponse.enabled',
+       'nexus.gitops.enabled',
+       'nexus.compliance.enabled',
++      'nexus.memoryTiering.enabled',
++      'nexus.memoryTiering.policy',
+     ]) {
+       expect(vars, `wizard missing variable ${v}`).toContain(v);
+     }
+@@ -215,7 +217,7 @@ describe('installer · wizard questions cover every install-time setting', () =>
+ 
+ describe('installer · overlay scripts are present + executable', () => {
+   const binDir = join(INSTALLER, 'overlay', 'usr', 'bin');
+-  for (const script of ['nexus-bootstrap', 'nexus-cockpit', 'nexus-postinstall']) {
++  for (const script of ['nexus-bootstrap', 'nexus-cockpit', 'nexus-postinstall', 'nexus-memory-tiering']) {
+     it(`${script} exists and starts with a bash shebang`, () => {
+       const p = join(binDir, script);
+       expect(existsSync(p), `${p} missing`).toBe(true);
+diff --git a/installer/tests/memory-tiering.test.ts b/installer/tests/memory-tiering.test.ts
+new file mode 100644
+index 00000000..85bf8456
+--- /dev/null
++++ b/installer/tests/memory-tiering.test.ts
+@@ -0,0 +1,395 @@
++/**
++ * Contract tests for installer/overlay/usr/lib/nexus/memory_tiering.py.
++ *
++ * Discovery, planning, and metrics all take injectable /proc and /sys roots
++ * so the suite never needs CXL DIMMs, Optane, or a spare NVMe. Apply is
++ * exercised against those same trees (writes stay inside the temp dir).
++ */
++
++import { execFileSync } from 'node:child_process';
++import {
++  chmodSync,
++  mkdirSync,
++  mkdtempSync,
++  rmSync,
++  writeFileSync,
++} from 'node:fs';
++import { tmpdir } from 'node:os';
++import { dirname, join, resolve } from 'node:path';
++import { afterAll, describe, expect, it } from 'vitest';
++
++const MODULE = resolve(__dirname, '../overlay/usr/lib/nexus/memory_tiering.py');
++const workdir = mkdtempSync(join(tmpdir(), 'nexus-memtier-'));
++
++afterAll(() => rmSync(workdir, { recursive: true, force: true }));
++
++function py<T>(snippet: string, env: Record<string, string> = {}): T {
++  const script = [
++    'import importlib.util, json, os, sys',
++    `spec = importlib.util.spec_from_file_location("mt", ${JSON.stringify(MODULE)})`,
++    'mt = importlib.util.module_from_spec(spec)',
++    'spec.loader.exec_module(mt)',
++    snippet,
++  ].join('\n');
++  const out = execFileSync('python3', ['-c', script], {
++    encoding: 'utf-8',
++    env: { ...process.env, ...env },
++  });
++  return JSON.parse(out) as T;
++}
++
++function write(path: string, contents: string): void {
++  mkdirSync(dirname(path), { recursive: true });
++  writeFileSync(path, contents);
++}
++
++function buildTree(name: string): { sys: string; proc: string; run: string; varlib: string } {
++  const root = join(workdir, name);
++  const sys = join(root, 'sys');
++  const proc = join(root, 'proc');
++  const run = join(root, 'run');
++  const varlib = join(root, 'var', 'lib', 'nexus');
++  mkdirSync(sys, { recursive: true });
++  mkdirSync(proc, { recursive: true });
++  mkdirSync(run, { recursive: true });
++  mkdirSync(varlib, { recursive: true });
++  return { sys, proc, run, varlib };
++}
++
++/** Two-socket DRAM + CXL memory-only nodes + Optane DAX + spare NVMe. */
++function populatedHardware() {
++  const t = buildTree('full');
++
++  write(join(t.proc, 'cmdline'), 'BOOT_IMAGE=/vmlinuz root=LABEL=COS_STATE nexus.features.memory_tiering=auto\n');
++  write(
++    join(t.proc, 'meminfo'),
++    [
++      'MemTotal:       67108864 kB',
++      'MemAvailable:   33554432 kB',
++      'SwapTotal:            0 kB',
++      'SwapFree:             0 kB',
++      'AnonPages:      10485760 kB',
++      'Committed_AS:   20971520 kB',
++      'VmallocUsed:       1024 kB',
++      'HugePages_Total:      0',
++      'HugePages_Free:       0',
++      'Hugepagesize:      2048 kB',
++      'Shmem:              512 kB',
++      'Active(anon):   8388608 kB',
++      'Inactive(anon): 2097152 kB',
++      'Active(file):   4194304 kB',
++      'Inactive(file): 1048576 kB',
++      '',
++    ].join('\n'),
++  );
++  write(
++    join(t.proc, 'vmstat'),
++    [
++      'nr_free_pages 1000',
++      'pgdemote_kswapd 12',
++      'pgdemote_direct 3',
++      'pgpromote_success 4',
++      'pgpromote_candidate 9',
++      'pswpin 0',
++      'pswpout 0',
++      'zswpin 0',
++      'zswpout 0',
++      'pgfault 100',
++      'pgmajfault 2',
++      'numa_hit 800',
++      'numa_miss 40',
++      'numa_foreign 5',
++      'pgmigrate_success 7',
++      '',
++    ].join('\n'),
++  );
++  write(join(t.proc, 'swaps'), 'Filename\tType\tSize\tUsed\tPriority\n');
++  write(join(t.proc, 'pressure', 'memory'), 'some avg10=1.00 avg60=2.00 avg300=3.00 total=100\nfull avg10=0.10 avg60=0.20 avg300=0.30 total=10\n');
++  write(join(t.proc, 'pressure', 'cpu'), 'some avg10=4.00 avg60=5.00 avg300=6.00 total=200\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n');
++  write(join(t.proc, 'pressure', 'io'), 'some avg10=7.00 avg60=8.00 avg300=9.00 total=300\nfull avg10=1.00 avg60=1.00 avg300=1.00 total=20\n');
++  write(join(t.proc, 'stat'), 'cpu  100 0 50 850 0 0 0 0 0 0\ncpu0 40 0 20 340 0 0 0 0 0 0\ncpu1 60 0 30 510 0 0 0 0 0 0\n');
++
++  write(join(t.sys, 'devices/system/node/node0/cpulist'), '0-1\n');
++  write(join(t.sys, 'devices/system/node/node0/distance'), '10 21 40 41\n');
++  write(join(t.sys, 'devices/system/node/node0/meminfo'), 'Node 0 MemTotal: 33554432 kB\nNode 0 MemUsed: 16777216 kB\n');
++  write(join(t.sys, 'devices/system/node/node1/cpulist'), '2-3\n');
++  write(join(t.sys, 'devices/system/node/node1/distance'), '21 10 41 40\n');
++  write(join(t.sys, 'devices/system/node/node1/meminfo'), 'Node 1 MemTotal: 33554432 kB\nNode 1 MemUsed: 8388608 kB\n');
++  write(join(t.sys, 'devices/system/node/node2/cpulist'), '\n');
++  write(join(t.sys, 'devices/system/node/node2/distance'), '40 41 10 21\n');
++  write(join(t.sys, 'devices/system/node/node2/meminfo'), 'Node 2 MemTotal: 67108864 kB\nNode 2 MemUsed: 1048576 kB\n');
++  write(join(t.sys, 'devices/system/node/node3/cpulist'), '\n');
++  write(join(t.sys, 'devices/system/node/node3/distance'), '41 40 21 10\n');
++  write(join(t.sys, 'devices/system/node/node3/meminfo'), 'Node 3 MemTotal: 67108864 kB\nNode 3 MemUsed: 2097152 kB\n');
++
++  write(join(t.sys, 'devices/virtual/memory_tiering/memory_tier4/nodelist'), '0-1\n');
++  write(join(t.sys, 'devices/virtual/memory_tiering/memory_tier8/nodelist'), '2-3\n');
++
++  write(join(t.sys, 'bus/cxl/devices/mem0/serial'), 'cxl-mem-0\n');
++  write(join(t.sys, 'bus/cxl/devices/decoder0.0/size'), '0x1000000000\n');
++  mkdirSync(join(t.sys, 'bus/cxl/devices/port1'), { recursive: true });
++  mkdirSync(join(t.sys, 'bus/cxl/devices/switch0'), { recursive: true });
++  mkdirSync(join(t.sys, 'bus/cxl/drivers/cxl_mem'), { recursive: true });
++
++  write(join(t.sys, 'bus/dax/devices/dax0.0/size'), `${128 * 1024 * 1024 * 1024}\n`);
++  write(join(t.sys, 'bus/dax/devices/dax0.0/target_node'), '4\n');
++  write(join(t.sys, 'bus/dax/devices/dax0.0/align'), '2097152\n');
++  mkdirSync(join(t.sys, 'bus/dax/drivers/device_dax'), { recursive: true });
++  mkdirSync(join(t.sys, 'bus/dax/drivers/kmem'), { recursive: true });
++  write(join(t.sys, 'bus/dax/drivers/kmem/new_id'), '');
++  write(join(t.sys, 'bus/dax/drivers/kmem/bind'), '');
++  chmodSync(join(t.sys, 'bus/dax/drivers/kmem/bind'), 0o644);
++
++  write(join(t.sys, 'class/block/pmem0/size'), `${256 * 1024 * 1024 * 2}\n`); // 512-byte sectors → 256 GiB
++  write(join(t.sys, 'class/block/nvme0n1/size'), `${100 * 1024 * 1024 * 2}\n`);
++  write(join(t.sys, 'class/block/nvme1n1/size'), `${400 * 1024 * 1024 * 2}\n`);
++  mkdirSync(join(t.sys, 'class/block/nvme0n1/holders'), { recursive: true });
++  mkdirSync(join(t.sys, 'class/block/nvme1n1/holders'), { recursive: true });
++  write(join(t.sys, 'block/nvme0n1/dev'), '259:0\n');
++  write(join(t.sys, 'block/nvme1n1/dev'), '259:1\n');
++  write(join(t.proc, 'mounts'), '/dev/nvme0n1p2 / ext4 rw 0 0\n');
++
++  write(join(t.sys, 'module/zswap/parameters/enabled'), 'N\n');
++  write(join(t.sys, 'module/zswap/parameters/compressor'), 'lzo\n');
++  write(join(t.sys, 'module/zswap/parameters/max_pool_percent'), '20\n');
++  write(join(t.sys, 'kernel/mm/zswap/stored_pages'), '0\n');
++  write(join(t.sys, 'kernel/mm/zswap/pool_limit_hit'), '0\n');
++  write(join(t.sys, 'kernel/mm/zswap/written_back_pages'), '0\n');
++  write(join(t.sys, 'kernel/mm/numa/demotion_enabled'), '0\n');
++  write(join(t.proc, 'sys/kernel/numa_balancing'), '0\n');
++  mkdirSync(join(t.sys, 'kernel/mm/damon'), { recursive: true });
++  mkdirSync(join(t.sys, 'module/damon_tier/parameters'), { recursive: true });
++  write(join(t.sys, 'module/damon_tier/parameters/enabled'), '0\n');
++  mkdirSync(join(t.sys, 'kernel/mm/mempolicy/weighted_interleave'), { recursive: true });
++  write(join(t.sys, 'kernel/mm/mempolicy/weighted_interleave/node0'), '1\n');
++  write(join(t.sys, 'kernel/mm/mempolicy/weighted_interleave/node2'), '1\n');
++  mkdirSync(join(t.sys, 'devices/system/package'), { recursive: true });
++  mkdirSync(join(t.sys, 'kernel/mm/pghot'), { recursive: true });
++  write(join(t.sys, 'kernel/mm/hugepages/hugepages-2048kB/nr_hugepages'), '0\n');
++  write(join(t.sys, 'kernel/mm/hugepages/hugepages-2048kB/free_hugepages'), '0\n');
++  write(join(t.sys, 'kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages'), '0\n');
++  write(join(t.sys, 'kernel/mm/hugepages/hugepages-1048576kB/free_hugepages'), '0\n');
++
++  return t;
++}
++
++describe('memory_tiering discover', () => {
++  it('classifies CPU+DRAM nodes separately from memory-only CXL/PMem nodes', () => {
++    const t = populatedHardware();
++    const inv = py<{
++      dramNodes: number[];
++      memoryOnlyNodes: number[];
++      cxlDevices: string[];
++      daxDevices: string[];
++    }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'print(json.dumps({',
++        '  "dramNodes": inv["dramNodes"],',
++        '  "memoryOnlyNodes": inv["memoryOnlyNodes"],',
++        '  "cxlDevices": [d["id"] for d in inv["cxlDevices"]],',
++        '  "daxDevices": [d["id"] for d in inv["daxDevices"]],',
++        '}))',
++      ].join('\n'),
++    );
++    expect(inv.dramNodes).toEqual([0, 1]);
++    expect(inv.memoryOnlyNodes).toEqual([2, 3]);
++    expect(inv.cxlDevices).toContain('mem0');
++    expect(inv.daxDevices).toContain('dax0.0');
++  });
++
++  it('detects kernel capabilities that exist now and ones reserved for future kernels', () => {
++    const t = populatedHardware();
++    const caps = py<Record<string, boolean>>(
++      `print(json.dumps(mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})["capabilities"]))`,
++    );
++    expect(caps.demotion).toBe(true);
++    expect(caps.numaBalancing).toBe(true);
++    expect(caps.memoryTiersSysfs).toBe(true);
++    expect(caps.zswap).toBe(true);
++    expect(caps.damon).toBe(true);
++    expect(caps.damonTier).toBe(true);
++    expect(caps.weightedInterleave).toBe(true);
++    expect(caps.packageAware).toBe(true);
++    expect(caps.pghot).toBe(true);
++    expect(caps.cxlDriver).toBe(true);
++    expect(caps.daxKmem).toBe(true);
++    expect(caps.cxlPoolingSwitch).toBe(true);
++  });
++});
++
++describe('memory_tiering plan', () => {
++  it('plans demotion, NUMA balancing tiering, DAX kmem, zswap, NVMe swap, and DAMON when hardware is present', () => {
++    const t = populatedHardware();
++    const plan = py<{ ops: string[]; waiting: string[] }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'cfg = mt.default_config()',
++        `plan = mt.plan(inv, cfg, proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)})`,
++        'print(json.dumps({"ops": [a["op"] for a in plan["actions"]], "waiting": plan["waiting"]}))',
++      ].join('\n'),
++    );
++    expect(plan.ops).toEqual(
++      expect.arrayContaining([
++        'enable_demotion',
++        'enable_numa_balancing_tiering',
++        'bind_dax_kmem',
++        'enable_zswap',
++        'prepare_nvme_swap',
++        'enable_damon_tier',
++        'prepare_hypervisor_nvme_dir',
++      ]),
++    );
++    expect(plan.waiting).toEqual(expect.arrayContaining(['hbm', 'compressed-cxl']));
++    expect(plan.waiting).not.toEqual(expect.arrayContaining(['cxl', 'phase-change', 'nvme-swap']));
++  });
++
++  it('does not select a mounted NVMe as the swap device', () => {
++    const t = populatedHardware();
++    const plan = py<{ swapDevice: string | null }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'cfg = mt.default_config()',
++        `plan = mt.plan(inv, cfg, proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)})`,
++        'swap = next(a for a in plan["actions"] if a["op"] == "prepare_nvme_swap")',
++        'print(json.dumps({"swapDevice": swap.get("device")}))',
++      ].join('\n'),
++    );
++    expect(plan.swapDevice).toBe('/dev/nvme1n1');
++  });
++
++  it('records waiting_for_hardware instead of failing when CXL/PMem/NVMe are absent', () => {
++    const t = buildTree('empty');
++    write(join(t.proc, 'cmdline'), 'root=LABEL=COS_STATE\n');
++    write(join(t.proc, 'meminfo'), 'MemTotal: 2048000 kB\nMemAvailable: 1024000 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n');
++    write(join(t.proc, 'vmstat'), 'nr_free_pages 1\n');
++    write(join(t.proc, 'swaps'), 'Filename\tType\tSize\tUsed\tPriority\n');
++    mkdirSync(join(t.sys, 'devices/system/node/node0'), { recursive: true });
++    write(join(t.sys, 'devices/system/node/node0/cpulist'), '0\n');
++    write(join(t.sys, 'devices/system/node/node0/meminfo'), 'Node 0 MemTotal: 2048000 kB\n');
++    const plan = py<{ ops: string[]; waiting: string[] }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'cfg = mt.default_config()',
++        `plan = mt.plan(inv, cfg, proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)})`,
++        'print(json.dumps({"ops": [a["op"] for a in plan["actions"]], "waiting": plan["waiting"]}))',
++      ].join('\n'),
++    );
++    expect(plan.waiting).toEqual(
++      expect.arrayContaining(['cxl', 'phase-change', 'nvme-swap', 'memory-only-numa']),
++    );
++    expect(plan.ops).not.toContain('bind_dax_kmem');
++    expect(plan.ops).not.toContain('enable_demotion');
++  });
++
++  it('plans weighted interleave instead of demotion when policy is bandwidth', () => {
++    const t = populatedHardware();
++    const plan = py<{ ops: string[] }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'cfg = mt.default_config()',
++        'cfg["policy"] = "bandwidth"',
++        `plan = mt.plan(inv, cfg, proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)})`,
++        'print(json.dumps({"ops": [a["op"] for a in plan["actions"]]}))',
++      ].join('\n'),
++    );
++    expect(plan.ops).toContain('enable_weighted_interleave');
++    expect(plan.ops).not.toContain('enable_demotion');
++  });
++
++  it('honours nexus.features.memory_tiering=false on the kernel command line', () => {
++    const t = populatedHardware();
++    write(join(t.proc, 'cmdline'), 'root=/dev/sda nexus.features.memory_tiering=false\n');
++    const plan = py<{ enabled: boolean; ops: string[] }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        `cfg = mt.config_from_cmdline(mt.default_config(), ${JSON.stringify(t.proc)})`,
++        `plan = mt.plan(inv, cfg, proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)})`,
++        'print(json.dumps({"enabled": cfg["enabled"], "ops": [a["op"] for a in plan["actions"]]}))',
++      ].join('\n'),
++    );
++    expect(plan.enabled).toBe(false);
++    expect(plan.ops).toEqual([]);
++  });
++});
++
++describe('memory_tiering apply and metrics', () => {
++  it('writes demotion and NUMA-balancing sysctls into the fake proc/sys tree', () => {
++    const t = populatedHardware();
++    const result = py<{ demotion: string; balancing: string; zswap: string }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'cfg = mt.default_config()',
++        `plan = mt.plan(inv, cfg, proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)})`,
++        `applied = mt.apply_actions(plan["actions"], proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)}, run_root=${JSON.stringify(t.run)}, var_root=${JSON.stringify(t.varlib)}, dry_run=False)`,
++        `demotion = open(${JSON.stringify(join(t.sys, 'kernel/mm/numa/demotion_enabled'))}).read().strip()`,
++        `balancing = open(${JSON.stringify(join(t.proc, 'sys/kernel/numa_balancing'))}).read().strip()`,
++        `zswap = open(${JSON.stringify(join(t.sys, 'module/zswap/parameters/enabled'))}).read().strip()`,
++        'print(json.dumps({"demotion": demotion, "balancing": balancing, "zswap": zswap}))',
++      ].join('\n'),
++    );
++    expect(result.demotion).toBe('1');
++    expect(result.balancing).toBe('2');
++    expect(['Y', '1']).toContain(result.zswap);
++  });
++
++  it('collects virtual memory, swap, zswap, PSI, demotion, and tier membership without fabricating zeros for missing files', () => {
++    const t = populatedHardware();
++    const metrics = py<{
++      meminfo: { memTotalKb: number; swapTotalKb: number };
++      vmstat: { pgdemoteKswapd: number; pgpromoteSuccess: number };
++      psi: { memorySomeAvg10: number };
++      tiers: { id: string; nodelist: string }[];
++      zswap: { enabled: boolean | null; storedPages: number | null };
++      missing: string | null;
++    }>(
++      [
++        `m = mt.collect_metrics(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'print(json.dumps({',
++        '  "meminfo": {"memTotalKb": m["meminfo"]["memTotalKb"], "swapTotalKb": m["meminfo"]["swapTotalKb"]},',
++        '  "vmstat": {"pgdemoteKswapd": m["vmstat"]["pgdemoteKswapd"], "pgpromoteSuccess": m["vmstat"]["pgpromoteSuccess"]},',
++        '  "psi": {"memorySomeAvg10": m["psi"]["memory"]["some"]["avg10"]},',
++        '  "tiers": m["tiers"],',
++        '  "zswap": {"enabled": m["zswap"]["enabled"], "storedPages": m["zswap"]["storedPages"]},',
++        '  "missing": m["vmstat"].get("pgdemoteProactive"),',
++        '}))',
++      ].join('\n'),
++    );
++    expect(metrics.meminfo.memTotalKb).toBe(67108864);
++    expect(metrics.meminfo.swapTotalKb).toBe(0);
++    expect(metrics.vmstat.pgdemoteKswapd).toBe(12);
++    expect(metrics.vmstat.pgpromoteSuccess).toBe(4);
++    expect(metrics.psi.memorySomeAvg10).toBeCloseTo(1.0);
++    expect(metrics.tiers.map((tier) => tier.nodelist).sort()).toEqual(['0-1', '2-3']);
++    expect(metrics.zswap.enabled).toBe(false);
++    expect(metrics.zswap.storedPages).toBe(0);
++    expect(metrics.missing).toBeNull();
++  });
++
++  it('builds a live dashboard slice whose tiers include DRAM, CXL, phase-change, zswap, and swap', () => {
++    const t = populatedHardware();
++    const dash = py<{ ids: string[]; waiting: string[] }>(
++      [
++        `inv = mt.discover(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)})`,
++        'cfg = mt.default_config()',
++        `plan = mt.plan(inv, cfg, proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)})`,
++        `mt.apply_actions(plan["actions"], proc_root=${JSON.stringify(t.proc)}, sys_root=${JSON.stringify(t.sys)}, run_root=${JSON.stringify(t.run)}, var_root=${JSON.stringify(t.varlib)}, dry_run=False)`,
++        `d = mt.dashboard_slice(inv, plan, mt.collect_metrics(${JSON.stringify(t.proc)}, ${JSON.stringify(t.sys)}), cfg)`,
++        'print(json.dumps({"ids": [t["id"] for t in d["memoryTiers"]], "waiting": d["waitingForHardware"]}))',
++      ].join('\n'),
++    );
++    expect(dash.ids).toEqual(expect.arrayContaining(['dram', 'cxl', 'phase-change', 'zswap', 'nvme', 'swap']));
++  });
++});
++
++describe('memory_tiering kubevirt hints', () => {
++  it('emits dram-only vs tierable VM hints and reserved guest CXL/NVDIMM annotations', () => {
++    const hints = py<{ annotations: Record<string, string>; hugepagesTierable: boolean }>(
++      'print(json.dumps({"annotations": mt.kubevirt_annotations(), "hugepagesTierable": mt.kubevirt_preference("tierable")["hugepages"]}))',
++    );
++    expect(hints.annotations['nexus.io/memory-tiering']).toBe('auto');
++    expect(hints.annotations['nexus.io/guest-cxl']).toBe('reserved');
++    expect(hints.annotations['nexus.io/guest-nvdimm']).toBe('reserved');
++    expect(hints.hugepagesTierable).toBe(false);
++  });
++});
+diff --git a/src/App.tsx b/src/App.tsx
+index bdad28c6..7b8a4c24 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -570,7 +570,13 @@ function App() {
+             onFleetRefresh={() => void refreshDashboards()}
+           />
+         )}
+-        {cockpitView === 'processor-memory' && <ProcessorMemoryDashboardView telemetry={telemetry} dataSource={dataSource} />}
++        {cockpitView === 'processor-memory' && (
++          <ProcessorMemoryDashboardView
++            telemetry={telemetry}
++            dataSource={dataSource}
++            processorMemory={clusterDashboards.processorMemory}
++          />
++        )}
+         {cockpitView === 'environment' && (
+           <EnvironmentIntelHudView
+             telemetry={telemetry}
+diff --git a/src/components/NexusMachineWizard.tsx b/src/components/NexusMachineWizard.tsx
+index 2526a39a..7a0f9dca 100644
+--- a/src/components/NexusMachineWizard.tsx
++++ b/src/components/NexusMachineWizard.tsx
+@@ -213,8 +213,17 @@ export function NexusMachineWizard({
+             <label>
+               Memory tier mode
+               <select value={config.memoryTiering.mode} onChange={(event) => onChange({ ...config, memoryTiering: { ...config.memoryTiering, mode: event.target.value as HarvesterMachineConfig['memoryTiering']['mode'] } })}>
+-                <option value="nvme">NVMe tier</option>
+-                <option value="phase-change">Phase-change tier</option>
++                <option value="auto">Auto (CXL + PMem + NVMe swap when present)</option>
++                <option value="cxl">CXL Type-3 far memory</option>
++                <option value="phase-change">Phase-change / Optane PMem DAX</option>
++                <option value="nvme">NVMe zswap last tier</option>
++              </select>
++            </label>
++            <label>
++              Tiering policy
++              <select value={config.memoryTiering.policy} onChange={(event) => onChange({ ...config, memoryTiering: { ...config.memoryTiering, policy: event.target.value as HarvesterMachineConfig['memoryTiering']['policy'] } })}>
++                <option value="capacity">Capacity (demote/promote)</option>
++                <option value="bandwidth">Bandwidth (weighted interleave)</option>
+               </select>
+             </label>
+             <label>
+diff --git a/src/components/dashboards/Dashboards.tsx b/src/components/dashboards/Dashboards.tsx
+index 0d626c47..19ecaf8f 100644
+--- a/src/components/dashboards/Dashboards.tsx
++++ b/src/components/dashboards/Dashboards.tsx
+@@ -14,7 +14,7 @@ import {
+ import type { EnvironmentSnapshot } from '../../lib/liveTelemetry';
+ import type { LiveOperationsSlice } from '../../lib/telemetry/dashboardTypes';
+ import type { TelemetryDataSource } from '../../lib/telemetry/dashboardAdapters';
+-import type { MachinesDashboard, StorageDashboard, ConsoleChip } from '../../lib/dashboards';
++import type { MachinesDashboard, StorageDashboard, ConsoleChip, ProcessorMemoryDashboard } from '../../lib/dashboards';
+ import { consoleChipsFromFleet } from '../../lib/machineConsole';
+ import { MachineDetailPanel } from '../MachineDetailPanel';
+ import { ConsoleSession } from '../ConsoleSession';
+@@ -57,6 +57,20 @@ interface DashboardViewProps {
+   machinesDashboard?: MachinesDashboard;
+   networkingDashboard?: import('../../lib/dashboards').NetworkingDashboard;
+   operationsLinks?: LiveOperationsSlice;
++  processorMemory?: ProcessorMemoryDashboard & {
++    available?: boolean;
++    policy?: string;
++    enabled?: boolean;
++    waitingForHardware?: string[];
++    vmstat?: Record<string, number | null>;
++    zswap?: import('../../lib/telemetry/dashboardTypes').LiveProcessorMemorySlice['zswap'];
++    meminfo?: Record<string, number | null>;
++    demotionEnabled?: boolean | null;
++    numaBalancing?: number | null;
++    capabilities?: Record<string, boolean>;
++    notes?: string[];
++    error?: string;
++  };
+   onCreateWorkload?: (kind?: 'kubevirt-vm' | 'incus-lxc' | 'k8s-pod') => void;
+   onConfigureStorage?: () => void;
+   onConfigureNetwork?: () => void;
+@@ -1134,12 +1148,13 @@ function CoreHeatCell({ core }: { core: CpuCore }) {
+   );
+ }
+ 
+-export function ProcessorMemoryDashboardView({ telemetry, dataSource }: DashboardViewProps = {}) {
+-  if (dataSource === 'live') {
+-    return <DemoCatalogPlaceholder viewName="Processor & Memory" dataSource={dataSource} />;
+-  }
+-  const { numaZones, memoryTiers, pressureWaterfall, swapDevices, hugepages } = procmem;
++export function ProcessorMemoryDashboardView({ telemetry, dataSource, processorMemory }: DashboardViewProps = {}) {
++  const isLive = dataSource === 'live';
++  const catalog = processorMemory ?? procmem;
++  const { numaZones, memoryTiers, pressureWaterfall, swapDevices, hugepages } = catalog;
++  const dramTier = memoryTiers.find((tier) => tier.id === 'dram') ?? memoryTiers[0];
+   const liveZones = useMemo(() => {
++    if (isLive) return numaZones;
+     if (!telemetry) return numaZones;
+     const cpuFactor = telemetry.cpuPercent / 58;
+     return numaZones.map((zone) => ({
+@@ -1149,9 +1164,9 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource }: Dashboar
+         utilizationPercent: Math.max(4, Math.min(100, Math.round(core.utilizationPercent * cpuFactor))),
+       })),
+     }));
+-  }, [telemetry]);
++  }, [telemetry, numaZones, isLive]);
+   const livePressure = useMemo(() => {
+-    if (!telemetry) return pressureWaterfall;
++    if (isLive || !telemetry) return pressureWaterfall;
+     const cpuFactor = telemetry.cpuPercent / 58;
+     const memFactor = telemetry.ramPercent / 64;
+     return pressureWaterfall.map((sample, idx) => ({
+@@ -1159,25 +1174,38 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource }: Dashboar
+       cpuPressure: Math.round(sample.cpuPressure * (idx === pressureWaterfall.length - 1 ? cpuFactor : 1)),
+       memoryPressure: Math.round(sample.memoryPressure * (idx === pressureWaterfall.length - 1 ? memFactor : 1)),
+     }));
+-  }, [telemetry]);
+-  const maxPressure = Math.max(
+-    ...livePressure.flatMap((sample) => [sample.cpuPressure, sample.memoryPressure, sample.ioPressure]),
+-  );
++  }, [telemetry, pressureWaterfall, isLive]);
++  const pressureValues = livePressure.flatMap((sample) => [sample.cpuPressure, sample.memoryPressure, sample.ioPressure]);
++  const maxPressure = Math.max(1, ...pressureValues);
++  const extra = processorMemory;
+   return (
+     <section className="dash dash-procmem" aria-label="Processor and memory dashboard">
+       <RouteDecoration />
+       <header className="dash-header">
+         <div>
+           <span className="dash-kicker">CORE // MEMORY</span>
+-          <h2>{procmem.title}</h2>
+-          <p>NUMA core heatmap, memory tier topology, pressure waterfall, hugepages, swap devices.</p>
++          <h2>{catalog.title}</h2>
++          <p>
++            NUMA heatmap, DRAM/HBM/CXL/PMem/zswap/NVMe/swap tiers, PSI pressure, hugepages.
++            {isLive && extra?.policy ? ` Policy: ${extra.policy}.` : ''}
++          </p>
+         </div>
+         <div className="dash-totals">
+           <div><span>Cores</span><strong>{numaZones.reduce((sum, zone) => sum + zone.cores.length, 0)}</strong></div>
+-          <div><span>DRAM</span><strong>{memoryTiers[0]?.capacityGiB} GiB</strong></div>
++          <div><span>DRAM</span><strong>{dramTier ? `${dramTier.capacityGiB} GiB` : '—'}</strong></div>
++          {isLive ? (
++            <div><span>Demotion</span><strong>{extra?.demotionEnabled == null ? '—' : extra.demotionEnabled ? 'on' : 'off'}</strong></div>
++          ) : null}
+         </div>
+       </header>
+ 
++      {isLive && (extra?.waitingForHardware?.length ?? 0) > 0 ? (
++        <article className="dash-panel live-empty-panel">
++          <div className="panel-title"><span>Waiting for hardware</span><strong>{extra?.waitingForHardware?.length}</strong></div>
++          <p>These tiers activate when the firmware exposes them: {extra?.waitingForHardware?.join(', ')}.</p>
++        </article>
++      ) : null}
++
+       <article className="dash-panel">
+         <div className="panel-title"><span>NUMA core heatmap</span><strong>{numaZones.length} zones</strong></div>
+         <div className="numa-zones">
+@@ -1185,7 +1213,7 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource }: Dashboar
+             <div key={zone.id} className="numa-zone">
+               <div className="numa-head">
+                 <strong>{zone.id}</strong>
+-                <span>{zone.localRamGiB} GiB local · {zone.remoteHitsPct}% remote</span>
++                <span>{zone.localRamGiB} GiB local · {zone.remoteHitsPct == null ? '—' : `${zone.remoteHitsPct}% remote`}</span>
+               </div>
+               <div className="core-grid">
+                 {zone.cores.map((core) => <CoreHeatCell key={core.id} core={core} />)}
+@@ -1199,19 +1227,23 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource }: Dashboar
+         <article className="dash-panel">
+           <div className="panel-title"><span>Memory tier topology</span><strong>{memoryTiers.length} tiers</strong></div>
+           <ul className="memory-tiers">
+-            {memoryTiers.map((tier) => (
+-              <li key={tier.id} className={`tier-${tier.id}`}>
+-                <div className="tier-head">
+-                  <strong>{tier.label}</strong>
+-                  <span>{tier.usedGiB} / {tier.capacityGiB} GiB</span>
+-                </div>
+-                <div className="tier-bar"><i style={{ width: `${(tier.usedGiB / tier.capacityGiB) * 100}%` }} /></div>
+-                <div className="tier-sub">
+-                  <span>{tier.latencyNs}ns latency</span>
+-                  <span>{tier.throughputGiBs} GiB/s</span>
+-                </div>
+-              </li>
+-            ))}
++            {memoryTiers.map((tier) => {
++              const cap = tier.capacityGiB || 0;
++              const usedPct = cap > 0 ? (tier.usedGiB / cap) * 100 : 0;
++              return (
++                <li key={tier.id} className={`tier-${tier.id}`}>
++                  <div className="tier-head">
++                    <strong>{tier.label}</strong>
++                    <span>{tier.usedGiB} / {tier.capacityGiB} GiB{tier.present === false ? ' · absent' : ''}</span>
++                  </div>
++                  <div className="tier-bar"><i style={{ width: `${usedPct}%` }} /></div>
++                  <div className="tier-sub">
++                    <span>{tier.latencyNs == null ? '—' : `${tier.latencyNs}ns`} latency</span>
++                    <span>{tier.throughputGiBs == null ? '—' : `${tier.throughputGiBs} GiB/s`}</span>
++                  </div>
++                </li>
++              );
++            })}
+           </ul>
+         </article>
+ 
+@@ -1234,10 +1266,11 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource }: Dashboar
+         <article className="dash-panel">
+           <div className="panel-title"><span>Swap devices</span><strong>{swapDevices.length}</strong></div>
+           <ul className="swap-list">
++            {swapDevices.length === 0 ? <li><small>No swap active</small></li> : null}
+             {swapDevices.map((dev) => (
+               <li key={dev.device}>
+                 <strong>{dev.device}</strong>
+-                <div className="tier-bar"><i style={{ width: `${(dev.usedGiB / dev.sizeGiB) * 100}%` }} /></div>
++                <div className="tier-bar"><i style={{ width: `${dev.sizeGiB > 0 ? (dev.usedGiB / dev.sizeGiB) * 100 : 0}%` }} /></div>
+                 <small>{dev.usedGiB} / {dev.sizeGiB} GiB · prio {dev.priority}</small>
+               </li>
+             ))}
+@@ -1246,16 +1279,56 @@ export function ProcessorMemoryDashboardView({ telemetry, dataSource }: Dashboar
+         <article className="dash-panel">
+           <div className="panel-title"><span>Hugepages</span><strong>2MiB + 1GiB</strong></div>
+           <ul className="hugepage-list">
+-            {hugepages.map((page) => (
+-              <li key={page.sizeMiB}>
+-                <strong>{page.sizeMiB} MiB pages</strong>
+-                <div className="tier-bar"><i style={{ width: `${(page.allocated / (page.allocated + page.free)) * 100}%` }} /></div>
+-                <small>{page.allocated} allocated · {page.free} free</small>
+-              </li>
+-            ))}
++            {hugepages.map((page) => {
++              const total = page.allocated + page.free;
++              return (
++                <li key={page.sizeMiB}>
++                  <strong>{page.sizeMiB} MiB pages</strong>
++                  <div className="tier-bar"><i style={{ width: `${total > 0 ? (page.allocated / total) * 100 : 0}%` }} /></div>
++                  <small>{page.allocated} allocated · {page.free} free</small>
++                </li>
++              );
++            })}
+           </ul>
+         </article>
+       </div>
++
++      {isLive && extra?.vmstat ? (
++        <div className="dash-row dash-row-2">
++          <article className="dash-panel">
++            <div className="panel-title"><span>Virtual memory counters</span><strong>/proc/vmstat</strong></div>
++            <ul className="hugepage-list">
++              {[
++                ['pgdemoteKswapd', extra.vmstat.pgdemoteKswapd],
++                ['pgdemoteDirect', extra.vmstat.pgdemoteDirect],
++                ['pgpromoteSuccess', extra.vmstat.pgpromoteSuccess],
++                ['pswpin', extra.vmstat.pswpin],
++                ['pswpout', extra.vmstat.pswpout],
++                ['zswpin', extra.vmstat.zswpin],
++                ['zswpout', extra.vmstat.zswpout],
++                ['pgmajfault', extra.vmstat.pgmajfault],
++                ['numaHit', extra.vmstat.numaHit],
++                ['numaMiss', extra.vmstat.numaMiss],
++              ].map(([label, value]) => (
++                <li key={String(label)}>
++                  <strong>{label}</strong>
++                  <small>{value == null ? '—' : String(value)}</small>
++                </li>
++              ))}
++            </ul>
++          </article>
++          <article className="dash-panel">
++            <div className="panel-title"><span>zswap / committed</span><strong>meminfo</strong></div>
++            <ul className="hugepage-list">
++              <li><strong>zswap</strong><small>{extra.zswap?.enabled == null ? '—' : extra.zswap.enabled ? `on · ${extra.zswap.compressor ?? '—'}` : 'off'}</small></li>
++              <li><strong>zswap stored pages</strong><small>{extra.zswap?.storedPages == null ? '—' : extra.zswap.storedPages}</small></li>
++              <li><strong>Committed_AS</strong><small>{extra.meminfo?.committedAsKb == null ? '—' : `${Math.round((extra.meminfo.committedAsKb / 1024 / 1024) * 10) / 10} GiB`}</small></li>
++              <li><strong>AnonPages</strong><small>{extra.meminfo?.anonPagesKb == null ? '—' : `${Math.round((extra.meminfo.anonPagesKb / 1024 / 1024) * 10) / 10} GiB`}</small></li>
++              <li><strong>numa_balancing</strong><small>{extra.numaBalancing == null ? '—' : extra.numaBalancing}</small></li>
++            </ul>
++          </article>
++        </div>
++      ) : null}
+     </section>
+   );
+ }
+diff --git a/src/lib/dashboards.ts b/src/lib/dashboards.ts
+index 2f3c7d69..fec59dc7 100644
+--- a/src/lib/dashboards.ts
++++ b/src/lib/dashboards.ts
+@@ -287,16 +287,17 @@ export interface NumaZone {
+   id: string;
+   cores: CpuCore[];
+   localRamGiB: number;
+-  remoteHitsPct: number;
++  remoteHitsPct: number | null;
+ }
+ 
+ export interface MemoryTier {
+-  id: 'dram' | 'nvme' | 'phase-change' | 'swap';
++  id: 'dram' | 'hbm' | 'cxl' | 'nvme' | 'phase-change' | 'zswap' | 'swap';
+   label: string;
+   capacityGiB: number;
+   usedGiB: number;
+-  latencyNs: number;
+-  throughputGiBs: number;
++  latencyNs: number | null;
++  throughputGiBs: number | null;
++  present?: boolean;
+ }
+ 
+ export interface PressureSample {
+@@ -761,9 +762,12 @@ export function buildProcessorMemoryDashboard(): ProcessorMemoryDashboard {
+     title: 'Processor & Memory',
+     numaZones: [buildZone('numa-0', 32, 58, 256, 6), buildZone('numa-1', 32, 71, 256, 9)],
+     memoryTiers: [
++      { id: 'hbm', label: 'HBM', capacityGiB: 128, usedGiB: 96, latencyNs: 40, throughputGiBs: 128 },
+       { id: 'dram', label: 'DRAM DDR5', capacityGiB: 512, usedGiB: 388, latencyNs: 82, throughputGiBs: 64 },
+-      { id: 'nvme', label: 'Memory-tier NVMe', capacityGiB: 4096, usedGiB: 1820, latencyNs: 410, throughputGiBs: 18 },
+-      { id: 'phase-change', label: 'Phase-change tier', capacityGiB: 8192, usedGiB: 1240, latencyNs: 940, throughputGiBs: 9 },
++      { id: 'cxl', label: 'CXL Type-3', capacityGiB: 2048, usedGiB: 410, latencyNs: 180, throughputGiBs: 32 },
++      { id: 'nvme', label: 'Hypervisor NVMe page store', capacityGiB: 4096, usedGiB: 1820, latencyNs: 410, throughputGiBs: 18 },
++      { id: 'phase-change', label: 'Phase-change / PMem DAX', capacityGiB: 8192, usedGiB: 1240, latencyNs: 940, throughputGiBs: 9 },
++      { id: 'zswap', label: 'zswap (compressed DRAM)', capacityGiB: 128, usedGiB: 22, latencyNs: 200, throughputGiBs: 20 },
+       { id: 'swap', label: 'Swap (NVMe)', capacityGiB: 1024, usedGiB: 184, latencyNs: 2400, throughputGiBs: 4 },
+     ],
+     pressureWaterfall: [
+diff --git a/src/lib/harvesterMachineWizard.test.ts b/src/lib/harvesterMachineWizard.test.ts
+index e68df4fe..03163d0b 100644
+--- a/src/lib/harvesterMachineWizard.test.ts
++++ b/src/lib/harvesterMachineWizard.test.ts
+@@ -122,6 +122,7 @@ describe('harvester machine wizard', () => {
+       memoryTiering: {
+         enabled: true,
+         mode: 'nvme',
++        policy: 'capacity',
+         device: '/dev/nvme1n1',
+         ratio: 0.25,
+       },
+@@ -133,5 +134,6 @@ describe('harvester machine wizard', () => {
+     expect(plan.configYaml).toContain('device: /dev/nvme1n1');
+     expect(plan.bootParameters).toContain('nexus.features.nvme_over_rdma=true');
+     expect(plan.bootParameters).toContain('nexus.features.memory_tiering=nvme');
++    expect(plan.bootParameters).toContain('zswap.enabled=1');
+   });
+ });
+diff --git a/src/lib/harvesterMachineWizard.ts b/src/lib/harvesterMachineWizard.ts
+index 5caa12e7..158394f8 100644
+--- a/src/lib/harvesterMachineWizard.ts
++++ b/src/lib/harvesterMachineWizard.ts
+@@ -18,7 +18,8 @@ export interface NvmeOverRdmaConfig {
+ 
+ export interface MemoryTieringConfig {
+   enabled: boolean;
+-  mode: 'phase-change' | 'nvme';
++  mode: 'auto' | 'phase-change' | 'nvme' | 'cxl';
++  policy: 'capacity' | 'bandwidth';
+   device: string;
+   ratio: number;
+ }
+@@ -102,9 +103,10 @@ export function buildDefaultMachineConfig(): HarvesterMachineConfig {
+     },
+     memoryTiering: {
+       enabled: true,
+-      mode: 'nvme',
+-      device: '/dev/nvme1n1',
+-      ratio: 0.25,
++      mode: 'auto',
++      policy: 'capacity',
++      device: 'auto',
++      ratio: 1.0,
+     },
+     polyCompute: {
+       kubevirt: true,
+@@ -271,6 +273,7 @@ export function buildHarvesterMachineInstallPlan(config: HarvesterMachineConfig)
+       memory_tiering: {
+         enabled: config.memoryTiering.enabled,
+         mode: config.memoryTiering.mode,
++        policy: config.memoryTiering.policy,
+         device: config.memoryTiering.device,
+         ratio: config.memoryTiering.ratio,
+       },
+@@ -303,6 +306,10 @@ export function buildHarvesterMachineInstallPlan(config: HarvesterMachineConfig)
+       `harvester.install.management_interface=${config.managementInterface || '<management-interface>'}`,
+       `nexus.features.nvme_over_rdma=${config.nvmeOverRdma.enabled}`,
+       config.memoryTiering.enabled ? `nexus.features.memory_tiering=${config.memoryTiering.mode}` : 'nexus.features.memory_tiering=false',
++      config.memoryTiering.enabled ? `nexus.features.memory_tiering.policy=${config.memoryTiering.policy}` : 'nexus.features.memory_tiering.policy=off',
++      ...(config.memoryTiering.enabled
++        ? ['zswap.enabled=1', 'zswap.compressor=zstd', 'zswap.max_pool_percent=20']
++        : []),
+       `nexus.poly_compute=${[
+         config.polyCompute.kubevirt ? 'kubevirt' : null,
+         config.polyCompute.incusLxc ? 'incus' : null,
+diff --git a/src/lib/telemetry/dashboardAdapters.test.ts b/src/lib/telemetry/dashboardAdapters.test.ts
+index 1c0fa5d9..76e7df96 100644
+--- a/src/lib/telemetry/dashboardAdapters.test.ts
++++ b/src/lib/telemetry/dashboardAdapters.test.ts
+@@ -99,6 +99,18 @@ const samplePayload: DashboardTelemetryPayload = {
+     harvesterReadyZ: '/readyz',
+     monitoringEnabled: true,
+   },
++  processorMemory: {
++    available: true,
++    memoryTiers: [
++      { id: 'dram', label: 'DRAM', capacityGiB: 32, usedGiB: 8, latencyNs: 80, throughputGiBs: 64, present: true },
++      { id: 'cxl', label: 'CXL Type-3', capacityGiB: 0, usedGiB: 0, latencyNs: null, throughputGiBs: null, present: false },
++      { id: 'swap', label: 'Swap', capacityGiB: 0, usedGiB: 0, latencyNs: 2400, throughputGiBs: 4, present: false },
++    ],
++    numaZones: [{ id: 'node0', localRamGiB: 32, remoteHitsPct: 2.5, cores: [] }],
++    waitingForHardware: ['cxl'],
++    vmstat: { pgdemoteKswapd: 0, pswpin: 0 },
++    demotionEnabled: false,
++  },
+ };
+ 
+ describe('buildClusterDashboardBundle', () => {
+@@ -132,6 +144,13 @@ describe('buildClusterDashboardBundle', () => {
+     expect(bundle.machines.fleet.filter((row) => row.kind === 'node')).toHaveLength(3);
+   });
+ 
++  it('maps live processor-memory tiers without substituting demo DRAM sizes', () => {
++    const bundle = buildClusterDashboardBundle(samplePayload, 'live');
++    expect(bundle.processorMemory?.available).toBe(true);
++    expect(bundle.processorMemory?.memoryTiers.find((tier) => tier.id === 'dram')?.capacityGiB).toBe(32);
++    expect(bundle.processorMemory?.waitingForHardware).toContain('cxl');
++  });
++
+   it('uses live networking inventory without demo catalog merge', () => {
+     const bundle = buildClusterDashboardBundle(samplePayload, 'live');
+     expect(bundle.networking.vlans).toEqual([]);
+diff --git a/src/lib/telemetry/dashboardAdapters.ts b/src/lib/telemetry/dashboardAdapters.ts
+index 3230806e..13a1a4df 100644
+--- a/src/lib/telemetry/dashboardAdapters.ts
++++ b/src/lib/telemetry/dashboardAdapters.ts
+@@ -2,10 +2,12 @@ import {
+   buildMachinesDashboard,
+   buildNetworkingDashboard,
+   buildStorageDashboard,
++  buildProcessorMemoryDashboard,
+   type MachineRow,
+   type MachinesDashboard,
+   type NetworkingDashboard,
+   type StorageDashboard,
++  type ProcessorMemoryDashboard,
+ } from '../dashboards';
+ import { buildResourceMonitoring, type ResourceMonitoring } from '../activeOperations';
+ import { consoleChipsFromFleet } from '../machineConsole';
+@@ -21,6 +23,7 @@ import type {
+   LiveNetworkingSlice,
+   LiveResourceMonitoringSlice,
+   LiveStorageSlice,
++  LiveProcessorMemorySlice,
+ } from './dashboardTypes';
+ 
+ export type TelemetryDataSource = 'demo' | 'live';
+@@ -33,6 +36,20 @@ export interface ClusterDashboardBundle {
+   resourceMonitoring: ResourceMonitoring;
+   xdr?: DashboardTelemetryPayload['xdr'];
+   operations?: DashboardTelemetryPayload['operations'];
++  processorMemory?: ProcessorMemoryDashboard & {
++    available?: boolean;
++    policy?: string;
++    enabled?: boolean;
++    waitingForHardware?: string[];
++    vmstat?: Record<string, number | null>;
++    zswap?: LiveProcessorMemorySlice['zswap'];
++    meminfo?: Record<string, number | null>;
++    demotionEnabled?: boolean | null;
++    numaBalancing?: number | null;
++    capabilities?: Record<string, boolean>;
++    notes?: string[];
++    error?: string;
++  };
+ }
+ 
+ const EMPTY_STORAGE: StorageDashboard = {
+@@ -292,6 +309,72 @@ function mergeResourceMonitoring(
+ }
+ 
+ 
++function buildLiveProcessorMemory(live?: LiveProcessorMemorySlice | null): ClusterDashboardBundle['processorMemory'] {
++  const fallback = buildProcessorMemoryDashboard();
++  if (!live || live.available === false) {
++    return {
++      ...fallback,
++      numaZones: [],
++      memoryTiers: [],
++      pressureWaterfall: [],
++      swapDevices: [],
++      hugepages: [],
++      available: false,
++      waitingForHardware: live?.waitingForHardware ?? [],
++      error: live?.error,
++    };
++  }
++  return {
++    id: 'processor-memory',
++    title: fallback.title,
++    numaZones: (live.numaZones ?? []).map((zone) => ({
++      id: zone.id,
++      localRamGiB: zone.localRamGiB,
++      remoteHitsPct: zone.remoteHitsPct,
++      cores: zone.cores?.length
++        ? zone.cores
++        : [],
++    })),
++    memoryTiers: (live.memoryTiers ?? []).map((tier) => ({
++      id: tier.id,
++      label: tier.label,
++      capacityGiB: tier.capacityGiB,
++      usedGiB: tier.usedGiB,
++      latencyNs: tier.latencyNs,
++      throughputGiBs: tier.throughputGiBs,
++      present: tier.present,
++    })),
++    pressureWaterfall: (live.pressureWaterfall ?? []).map((sample) => ({
++      label: sample.label,
++      cpuPressure: sample.cpuPressure ?? 0,
++      memoryPressure: sample.memoryPressure ?? 0,
++      ioPressure: sample.ioPressure ?? 0,
++    })),
++    swapDevices: (live.swapDevices ?? []).map((dev) => ({
++      device: dev.device,
++      sizeGiB: dev.sizeGiB,
++      usedGiB: dev.usedGiB,
++      priority: dev.priority ?? 0,
++    })),
++    hugepages: (live.hugepages ?? []).map((page) => ({
++      sizeMiB: page.sizeMiB ?? 0,
++      allocated: page.allocated ?? 0,
++      free: page.free ?? 0,
++    })),
++    available: true,
++    policy: live.policy,
++    enabled: live.enabled,
++    waitingForHardware: live.waitingForHardware ?? [],
++    vmstat: live.vmstat,
++    zswap: live.zswap,
++    meminfo: live.meminfo,
++    demotionEnabled: live.demotionEnabled,
++    numaBalancing: live.numaBalancing,
++    capabilities: live.capabilities,
++    notes: live.notes,
++  };
++}
++
+ export function buildClusterDashboardBundle(
+   payload: DashboardTelemetryPayload | null | undefined,
+   dataSource: TelemetryDataSource,
+@@ -327,6 +410,7 @@ export function buildClusterDashboardBundle(
+       resourceMonitoring: mergedResource,
+       xdr: undefined,
+       operations: undefined,
++      processorMemory: buildProcessorMemoryDashboard(),
+     };
+   }
+ 
+@@ -379,6 +463,7 @@ export function buildClusterDashboardBundle(
+     resourceMonitoring: buildLiveResourceMonitoring(live.resourceMonitoring),
+     xdr: payload?.xdr,
+     operations: payload?.operations,
++    processorMemory: buildLiveProcessorMemory(payload?.processorMemory),
+   };
+ 
+   const infraRows = infrastructureRowsFromPayload(payload);
+diff --git a/src/lib/telemetry/dashboardTypes.ts b/src/lib/telemetry/dashboardTypes.ts
+index 74f69a17..7ab854e6 100644
+--- a/src/lib/telemetry/dashboardTypes.ts
++++ b/src/lib/telemetry/dashboardTypes.ts
+@@ -90,6 +90,45 @@ export interface LiveOperationsSlice {
+   monitoringEnabled: boolean;
+ }
+ 
++export interface LiveMemoryTier {
++  id: 'dram' | 'hbm' | 'cxl' | 'nvme' | 'phase-change' | 'zswap' | 'swap';
++  label: string;
++  capacityGiB: number;
++  usedGiB: number;
++  latencyNs: number | null;
++  throughputGiBs: number | null;
++  present?: boolean;
++}
++
++export interface LiveProcessorMemorySlice {
++  available?: boolean;
++  id?: 'processor-memory';
++  title?: string;
++  policy?: string;
++  enabled?: boolean;
++  numaZones?: { id: string; hasCpu?: boolean; localRamGiB: number; remoteHitsPct: number | null; cores: { id: number; utilizationPercent: number; frequencyGhz: number; thread: 'p' | 'e' }[] }[];
++  memoryTiers?: LiveMemoryTier[];
++  pressureWaterfall?: { label: string; cpuPressure: number | null; memoryPressure: number | null; ioPressure: number | null }[];
++  swapDevices?: { device: string; sizeGiB: number; usedGiB: number; priority: number | null }[];
++  hugepages?: { sizeMiB: number | null; allocated: number | null; free: number | null }[];
++  vmstat?: Record<string, number | null>;
++  zswap?: {
++    enabled: boolean | null;
++    compressor: string | null;
++    maxPoolPercent: number | null;
++    storedPages: number | null;
++    poolLimitHit: number | null;
++    writtenBackPages: number | null;
++  };
++  meminfo?: Record<string, number | null>;
++  demotionEnabled?: boolean | null;
++  numaBalancing?: number | null;
++  waitingForHardware?: string[];
++  capabilities?: Record<string, boolean>;
++  notes?: string[];
++  error?: string;
++}
++
+ export interface DashboardTelemetryPayload {
+   environment: EnvironmentTelemetryPayload;
+   storage: LiveStorageSlice;
+@@ -98,4 +137,5 @@ export interface DashboardTelemetryPayload {
+   xdr: LiveXdrSlice;
+   operations: LiveOperationsSlice;
+   networking?: LiveNetworkingSlice;
++  processorMemory?: LiveProcessorMemorySlice;
+ }
+diff --git a/src/styles.css b/src/styles.css
+index de310bdf..9b5ce1ec 100644
+--- a/src/styles.css
++++ b/src/styles.css
+@@ -4416,8 +4416,11 @@ select {
+ .tier-bar i { display: block; height: 100%; background: var(--theme-accent); box-shadow: var(--theme-route-glow); }
+ .tier-sub { display: flex; justify-content: space-between; color: var(--theme-text-dim); font-size: 0.7rem; }
+ .tier-dram .tier-bar i { background: var(--theme-accent); }
++.tier-hbm .tier-bar i { background: var(--theme-good); }
++.tier-cxl .tier-bar i { background: var(--theme-accent-2); }
+ .tier-nvme .tier-bar i { background: var(--theme-channel-vm); }
+ .tier-phase-change .tier-bar i { background: var(--theme-channel-gitops); }
++.tier-zswap .tier-bar i { background: var(--theme-channel-storage); }
+ .tier-swap .tier-bar i { background: var(--theme-warn); }
+ 
+ .pressure-waterfall {
+-- 
+2.43.0
+

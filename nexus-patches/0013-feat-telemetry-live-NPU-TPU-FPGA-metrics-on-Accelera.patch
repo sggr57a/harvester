@@ -1,0 +1,1396 @@
+From 5e74f34f72aa932c3af42acd88c00a57cbc54e9d Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Wed, 19 Aug 2026 16:01:56 +0000
+Subject: [PATCH] feat(telemetry): live NPU/TPU/FPGA metrics on Acceleration
+ dashboards
+
+Inventory allowlisted add-in cards from sysfs (link, AER, temp, driver,
+IOMMU). Surface performance and issues on the existing Acceleration and
+Mission Control views. Utilization stays null unless a vendor exports it.
+---
+ AGENTS.md                                     |   2 +-
+ docs/accelerators.md                          |  24 +-
+ .../usr/lib/nexus/accelerator_inventory.py    | 337 ++++++++++++++++++
+ .../usr/lib/nexus/dashboard_collectors.py     |  24 ++
+ .../overlay/usr/lib/nexus/serve-cockpit.py    |  12 +
+ installer/tests/accelerator-inventory.test.ts | 228 ++++++++++++
+ src/App.tsx                                   |  16 +-
+ src/components/dashboards/Dashboards.tsx      | 202 ++++++++---
+ src/components/dashboards/MissionControl.tsx  |  47 ++-
+ src/lib/dashboards.ts                         |  20 +-
+ src/lib/telemetry/dashboardAdapters.test.ts   |  44 +++
+ src/lib/telemetry/dashboardAdapters.ts        |  64 ++++
+ src/lib/telemetry/dashboardTypes.ts           |  29 ++
+ 13 files changed, 986 insertions(+), 63 deletions(-)
+ create mode 100644 installer/overlay/usr/lib/nexus/accelerator_inventory.py
+ create mode 100644 installer/tests/accelerator-inventory.test.ts
+
+diff --git a/AGENTS.md b/AGENTS.md
+index 6f3d0019..d297095f 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -48,4 +48,4 @@ because it has no backend to authenticate against.
+ - Live XDR events come from Falco / Tetragon / Suricata / Wazuh pod logs via `xdr_ingest.py`; Kubernetes Warning events keep a derived severity instead of a hardcoded `medium`.
+ - Live consoles attach through `console_proxy.py` (`/api/v1/console/{vnc,serial,exec}`) onto KubeVirt subresources or `kubectl exec`. `src/lib/demoConsole.ts` is demo-mode only.
+ - Memory tiering is host-side (`memory_tiering.py` + `nexus-memory-tiering.service`). Live Processor & Memory reads `/proc` and `/sys` (demotion, zswap, swap, PSI, NUMA). Do not fabricate tier capacity when the hardware is absent — list it under `waitingForHardware`.
+-- NPU / TPU / FPGA add-in cards: allowlist and first-boot design in `docs/accelerators.md`. Do not claim live Coral / Alveo / Gaudi utilization until a host agent inventories PCI. Default consumption is Harvester `pcidevices-controller` VFIO, not a generic device plugin.
++- NPU / TPU / FPGA add-in cards: allowlist in `docs/accelerators.md`. Live Acceleration and Mission Control inventory comes from `accelerator_inventory.py` (PCIe link, AER, temp, driver, IOMMU). Do not fabricate card utilization. Default future consumption is Harvester `pcidevices-controller` VFIO, not a generic device plugin.
+diff --git a/docs/accelerators.md b/docs/accelerators.md
+index 6b114284..b803da0e 100644
+--- a/docs/accelerators.md
++++ b/docs/accelerators.md
+@@ -130,7 +130,29 @@ Default for Coral on Nexus: **Mode A**. Host DKMS on the ISO is a follow-up.
+ The demo dashboard’s “Google Coral Edge TPU” row is a placeholder; live mode
+ must show the real `1ac1:089a` device or `null` / waiting.
+ 
+-## First-boot agent (proposed, not implemented)
++## Live metrics (implemented)
++
++The Acceleration dashboard and Mission Control consume
++`GET /api/v1/telemetry/accelerators` (also nested under dashboards as
++`acceleration`). Host collector: `accelerator_inventory.py`.
++
++Measured when sysfs exports them:
++
++- PCIe current vs max link speed/width (downshift is an issue)
++- AER correctable / uncorrectable totals
++- `hwmon` temperature
++- runtime power state
++- bound driver, NUMA node, IOMMU group
++
++Never measured (stays `null`, not `0`): vendor SMU utilization, HBM/DRAM on the
++card, TOPS. Those need Gaudi/XRT/qaic/apex runtimes.
++
++Issues raised: `no-driver`, `no-iommu`, `pcie-link-downshifted`,
++`aer-correctable`, `aer-uncorrectable`. Missing allowlisted families are
++`waitingForHardware` (`npu-gaudi`, `npu-qaic`, `tpu-coral`, `fpga-alveo`,
++`fpga-intel-dfl`, `gpu-nvidia`).
++
++## First-boot VFIO agent (proposed, not implemented)
+ 
+ Mirror `memory_tiering.py`:
+ 
+diff --git a/installer/overlay/usr/lib/nexus/accelerator_inventory.py b/installer/overlay/usr/lib/nexus/accelerator_inventory.py
+new file mode 100644
+index 00000000..2676cb0d
+--- /dev/null
++++ b/installer/overlay/usr/lib/nexus/accelerator_inventory.py
+@@ -0,0 +1,337 @@
++#!/usr/bin/env python3
++"""Allowlisted NPU / TPU / FPGA / GPU PCI inventory for live Acceleration.
++
++Discovers cards from sysfs, never from a catalog. Performance counters that
++the kernel does not export stay ``None``. Issues are derived from link
++downshift, AER, missing driver, and missing IOMMU — not invented utilization.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++from typing import Any
++
++HEX = re.compile(r"0x([0-9a-fA-F]+)")
++NUM = re.compile(r"(\d+(?:\.\d+)?)")
++
++# Families advertised as waitingForHardware when absent.
++FAMILIES = (
++    "npu-gaudi",
++    "npu-qaic",
++    "tpu-coral",
++    "fpga-alveo",
++    "fpga-intel-dfl",
++    "gpu-nvidia",
++)
++
++GAUDI_IDS = {
++    "1063": "Intel Gaudi 3 PCIe",
++    "1060": "Intel Gaudi 3 OAM",
++    "1020": "Intel Gaudi 2",
++}
++
++DISPLAY_CLASSES = {"030000", "030200"}  # VGA / 3D controller
++NIC_PREFIX = "02"
++
++
++def _read(path: str) -> str | None:
++    try:
++        with open(path, encoding="utf-8", errors="replace") as handle:
++            return handle.read().strip()
++    except OSError:
++        return None
++
++
++def _hex_id(raw: str | None) -> str | None:
++    if not raw:
++        return None
++    match = HEX.search(raw)
++    return match.group(1).lower() if match else raw.lower().lstrip("0x")
++
++
++def _int_or_none(raw: str | None) -> int | None:
++    if raw is None:
++        return None
++    match = NUM.search(raw.replace(",", ""))
++    if not match:
++        return None
++    try:
++        return int(float(match.group(1)))
++    except ValueError:
++        return None
++
++
++def _float_or_none(raw: str | None) -> float | None:
++    if raw is None:
++        return None
++    match = NUM.search(raw)
++    if not match:
++        return None
++    try:
++        return float(match.group(1))
++    except ValueError:
++        return None
++
++
++def _link_gt(raw: str | None) -> float | None:
++    return _float_or_none(raw)
++
++
++def _aer_total(path: str) -> int | None:
++    text = _read(path)
++    if text is None:
++        return None
++    total = 0
++    found = False
++    for line in text.splitlines():
++        nums = NUM.findall(line.replace(",", ""))
++        if not nums:
++            continue
++        found = True
++        total += int(float(nums[-1]))
++    if not found:
++        try:
++            return int(text)
++        except ValueError:
++            return None
++    return total
++
++
++def _driver_name(dev_dir: str) -> str | None:
++    link = os.path.join(dev_dir, "driver")
++    try:
++        return os.path.basename(os.path.realpath(link))
++    except OSError:
++        return None
++
++
++def _iommu_group(dev_dir: str) -> str | None:
++    link = os.path.join(dev_dir, "iommu_group")
++    if not os.path.lexists(link):
++        return None
++    try:
++        return os.path.basename(os.path.realpath(link))
++    except OSError:
++        return None
++
++
++def _temperature_c(dev_dir: str) -> int | None:
++    hwmon = os.path.join(dev_dir, "hwmon")
++    if not os.path.isdir(hwmon):
++        return None
++    try:
++        names = os.listdir(hwmon)
++    except OSError:
++        return None
++    for name in sorted(names):
++        milli = _int_or_none(_read(os.path.join(hwmon, name, "temp1_input")))
++        if milli is not None:
++            return milli // 1000
++    return None
++
++
++def _class_code(raw: str | None) -> str:
++    hid = _hex_id(raw) or ""
++    return hid.zfill(6)[-6:]
++
++
++def classify(vendor: str, device: str, class_code: str, *, dfl: bool) -> tuple[str, str, str] | None:
++    """Return (kind, model, family) or None if the function is not an accelerator."""
++    if vendor == "1da3" and device in GAUDI_IDS:
++        return "npu", GAUDI_IDS[device], "npu-gaudi"
++    if vendor == "17cb" and device == "a100":
++        return "npu", "Qualcomm Cloud AI 100", "npu-qaic"
++    if vendor == "1ac1" and device == "089a":
++        return "tpu", "Google Coral Edge TPU", "tpu-coral"
++    if vendor == "10ee":
++        return "fpga", "AMD Alveo / Xilinx FPGA", "fpga-alveo"
++    if dfl and vendor == "8086":
++        return "fpga", "Intel FPGA (DFL)", "fpga-intel-dfl"
++    if vendor == "10de" and class_code in DISPLAY_CLASSES:
++        return "gpu", "NVIDIA GPU", "gpu-nvidia"
++    if vendor == "1002" and class_code in DISPLAY_CLASSES:
++        return "gpu", "AMD GPU", "gpu-amd"
++    return None
++
++
++def _dfl_bdfs(sys_root: str) -> set[str]:
++    found: set[str] = set()
++    region_root = os.path.join(sys_root, "class", "fpga_region")
++    if not os.path.isdir(region_root):
++        return found
++    try:
++        names = os.listdir(region_root)
++    except OSError:
++        return found
++    pci_root = os.path.realpath(os.path.join(sys_root, "bus", "pci", "devices"))
++    for name in names:
++        link = os.path.join(region_root, name, "device")
++        try:
++            target = os.path.realpath(link)
++        except OSError:
++            continue
++        bdf = os.path.basename(target)
++        if os.path.dirname(target) == pci_root or bdf.count(":") == 2:
++            found.add(bdf)
++    return found
++
++
++def _pci_devices(sys_root: str) -> list[str]:
++    root = os.path.join(sys_root, "bus", "pci", "devices")
++    if not os.path.isdir(root):
++        return []
++    try:
++        return sorted(os.listdir(root))
++    except OSError:
++        return []
++
++
++def inspect_device(sys_root: str, bdf: str, *, dfl: bool) -> dict[str, Any] | None:
++    dev_dir = os.path.join(sys_root, "bus", "pci", "devices", bdf)
++    vendor = _hex_id(_read(os.path.join(dev_dir, "vendor")))
++    device = _hex_id(_read(os.path.join(dev_dir, "device")))
++    class_code = _class_code(_read(os.path.join(dev_dir, "class")))
++    if not vendor or not device:
++        return None
++    if class_code.startswith(NIC_PREFIX) and vendor != "1ac1":
++        return None
++    classified = classify(vendor, device, class_code, dfl=dfl)
++    if classified is None:
++        return None
++    kind, model, family = classified
++    driver = _driver_name(dev_dir) if os.path.lexists(os.path.join(dev_dir, "driver")) else None
++    numa_raw = _read(os.path.join(dev_dir, "numa_node"))
++    numa_node = _int_or_none(numa_raw)
++    if numa_node is not None and numa_node < 0:
++        numa_node = None
++    current_speed = _read(os.path.join(dev_dir, "current_link_speed"))
++    max_speed = _read(os.path.join(dev_dir, "max_link_speed"))
++    current_width = _int_or_none(_read(os.path.join(dev_dir, "current_link_width")))
++    max_width = _int_or_none(_read(os.path.join(dev_dir, "max_link_width")))
++    cur_gt = _link_gt(current_speed)
++    max_gt = _link_gt(max_speed)
++    link_downshifted = bool(
++        (cur_gt is not None and max_gt is not None and cur_gt + 0.05 < max_gt)
++        or (current_width is not None and max_width is not None and current_width < max_width)
++    )
++    aer_corr = _aer_total(os.path.join(dev_dir, "aer_dev_correctable"))
++    aer_fatal = _aer_total(os.path.join(dev_dir, "aer_dev_fatal"))
++    aer_nonfatal = _aer_total(os.path.join(dev_dir, "aer_dev_nonfatal"))
++    aer_unc = None
++    if aer_fatal is not None or aer_nonfatal is not None:
++        aer_unc = (aer_fatal or 0) + (aer_nonfatal or 0)
++    issues: list[str] = []
++    if driver is None:
++        issues.append("no-driver")
++    if _iommu_group(dev_dir) is None:
++        issues.append("no-iommu")
++    if link_downshifted:
++        issues.append("pcie-link-downshifted")
++    if aer_corr is not None and aer_corr > 0:
++        issues.append("aer-correctable")
++    if aer_unc is not None and aer_unc > 0:
++        issues.append("aer-uncorrectable")
++    return {
++        "id": bdf,
++        "bdf": bdf,
++        "kind": kind,
++        "model": model,
++        "family": family,
++        "vendorId": vendor,
++        "deviceId": device,
++        "classCode": class_code,
++        "driver": driver,
++        "boundTo": driver,
++        "numaNode": numa_node,
++        "iommuGroup": _iommu_group(dev_dir),
++        "currentLinkSpeed": current_speed,
++        "currentLinkWidth": current_width,
++        "maxLinkSpeed": max_speed,
++        "maxLinkWidth": max_width,
++        "linkDownshifted": link_downshifted,
++        "aerCorrectable": aer_corr,
++        "aerUncorrectable": aer_unc,
++        "temperatureC": _temperature_c(dev_dir),
++        "runtimeStatus": _read(os.path.join(dev_dir, "power", "runtime_status")),
++        "utilizationPercent": None,
++        "memoryGiB": None,
++        "issues": issues,
++    }
++
++
++def discover(sys_root: str = "/sys") -> list[dict[str, Any]]:
++    dfl = _dfl_bdfs(sys_root)
++    devices: list[dict[str, Any]] = []
++    seen: set[str] = set()
++    for bdf in _pci_devices(sys_root):
++        rec = inspect_device(sys_root, bdf, dfl=bdf in dfl)
++        if rec is None:
++            continue
++        devices.append(rec)
++        seen.add(bdf)
++    for bdf in sorted(dfl - seen):
++        rec = inspect_device(sys_root, bdf, dfl=True)
++        if rec is not None:
++            devices.append(rec)
++    return devices
++
++
++def live_dashboard(sys_root: str = "/sys", proc_root: str = "/proc") -> dict[str, Any]:
++    del proc_root  # reserved for IRQ-rate sampling later
++    try:
++        devices = discover(sys_root)
++    except Exception as exc:  # noqa: BLE001
++        return {
++            "available": False,
++            "error": str(exc),
++            "devices": [],
++            "issues": [],
++            "waitingForHardware": list(FAMILIES),
++            "passThrough": [],
++        }
++    present = {str(dev.get("family")) for dev in devices}
++    waiting = [family for family in FAMILIES if family not in present]
++    cluster_issues: list[str] = []
++    for dev in devices:
++        for issue in dev.get("issues") or []:
++            cluster_issues.append(f"{dev['bdf']}: {issue}")
++    pass_through = [
++        {
++            "id": dev["bdf"],
++            "kind": dev["kind"],
++            "model": dev["model"],
++            "boundTo": dev["driver"] or "unbound",
++            "driver": dev["driver"] or "none",
++            "utilizationPercent": dev["utilizationPercent"],
++            "memoryGiB": dev["memoryGiB"],
++            "numaNode": dev["numaNode"],
++            "temperatureC": dev["temperatureC"],
++            "linkDownshifted": dev["linkDownshifted"],
++            "currentLinkSpeed": dev["currentLinkSpeed"],
++            "issues": dev["issues"],
++            "aerCorrectable": dev["aerCorrectable"],
++            "aerUncorrectable": dev["aerUncorrectable"],
++            "runtimeStatus": dev["runtimeStatus"],
++        }
++        for dev in devices
++    ]
++    return {
++        "available": True,
++        "id": "acceleration",
++        "title": "Acceleration & Hardware Pass-Through",
++        "devices": devices,
++        "passThrough": pass_through,
++        "issues": cluster_issues,
++        "waitingForHardware": waiting,
++        "error": None,
++    }
++
++
++if __name__ == "__main__":
++    import json
++    import sys
++
++    root = sys.argv[1] if len(sys.argv) > 1 else "/sys"
++    json.dump(live_dashboard(sys_root=root), sys.stdout, indent=2)
++    sys.stdout.write("\n")
+diff --git a/installer/overlay/usr/lib/nexus/dashboard_collectors.py b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+index 9a4aeb21..31eba879 100644
+--- a/installer/overlay/usr/lib/nexus/dashboard_collectors.py
++++ b/installer/overlay/usr/lib/nexus/dashboard_collectors.py
+@@ -27,6 +27,29 @@ except ImportError:
+     collect_networking_slice = None  # type: ignore[assignment,misc]
+ 
+ 
++def _collect_acceleration() -> dict[str, Any]:
++    """Live NPU / TPU / FPGA / GPU PCI inventory. Never fabricates utilization."""
++    try:
++        spec = importlib.util.spec_from_file_location(
++            "nexus_accelerator_inventory",
++            os.path.join(os.path.dirname(__file__), "accelerator_inventory.py"),
++        )
++        if spec is None or spec.loader is None:
++            raise ImportError("accelerator_inventory module missing")
++        module = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(module)
++        return module.live_dashboard()
++    except Exception as exc:  # noqa: BLE001
++        return {
++            "available": False,
++            "error": str(exc),
++            "devices": [],
++            "passThrough": [],
++            "issues": [],
++            "waitingForHardware": [],
++        }
++
++
+ def _collect_processor_memory() -> dict[str, Any]:
+     """Live NUMA / tier / swap / zswap / PSI snapshot. Never applies sysctls."""
+     try:
+@@ -592,6 +615,7 @@ def collect_dashboards_live() -> dict[str, Any]:
+         },
+         "networking": networking if isinstance(networking, dict) else {"available": False},
+         "processorMemory": _collect_processor_memory(),
++        "acceleration": _collect_acceleration(),
+     }
+ 
+ 
+diff --git a/installer/overlay/usr/lib/nexus/serve-cockpit.py b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+index 3d715d9a..b824a48f 100644
+--- a/installer/overlay/usr/lib/nexus/serve-cockpit.py
++++ b/installer/overlay/usr/lib/nexus/serve-cockpit.py
+@@ -170,6 +170,10 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             self._json_api(self._handle_memory_tiering)
+             return
+ 
++        if path == "/api/v1/telemetry/accelerators":
++            self._json_api(self._handle_accelerators)
++            return
++
+         if path.startswith("/api/v1/"):
+             self._plain(404, b"not found")
+             return
+@@ -372,6 +376,14 @@ class SPAHandler(http.server.SimpleHTTPRequestHandler):
+             return {"available": False, "error": "memory tiering collector unavailable"}
+         return collector()
+ 
++    def _handle_accelerators(self) -> dict:
++        if self._dashboards is None:
++            return {"available": False, "error": "dashboard collector unavailable"}
++        collector = getattr(self._dashboards, "_collect_acceleration", None)
++        if collector is None:
++            return {"available": False, "error": "accelerator collector unavailable"}
++        return collector()
++
+     def _handle_console_upgrade(self, path: str) -> None:
+         if self._console is None:
+             self._plain(503, b"console proxy unavailable")
+diff --git a/installer/tests/accelerator-inventory.test.ts b/installer/tests/accelerator-inventory.test.ts
+new file mode 100644
+index 00000000..9ba87889
+--- /dev/null
++++ b/installer/tests/accelerator-inventory.test.ts
+@@ -0,0 +1,228 @@
++/**
++ * Contract tests for installer/overlay/usr/lib/nexus/accelerator_inventory.py.
++ *
++ * Fake /sys PCI trees only — no FPGA/NPU/TPU hardware required.
++ */
++
++import { execFileSync } from 'node:child_process';
++import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
++import { tmpdir } from 'node:os';
++import { dirname, join, resolve } from 'node:path';
++import { afterAll, describe, expect, it } from 'vitest';
++
++const MODULE = resolve(__dirname, '../overlay/usr/lib/nexus/accelerator_inventory.py');
++const workdir = mkdtempSync(join(tmpdir(), 'nexus-accel-'));
++
++afterAll(() => rmSync(workdir, { recursive: true, force: true }));
++
++function py<T>(snippet: string): T {
++  const script = [
++    'import importlib.util, json, sys',
++    `spec = importlib.util.spec_from_file_location("ai", ${JSON.stringify(MODULE)})`,
++    'ai = importlib.util.module_from_spec(spec)',
++    'spec.loader.exec_module(ai)',
++    snippet,
++  ].join('\n');
++  const out = execFileSync('python3', ['-c', script], { encoding: 'utf-8' });
++  return JSON.parse(out) as T;
++}
++
++function write(path: string, contents: string): void {
++  mkdirSync(dirname(path), { recursive: true });
++  writeFileSync(path, contents);
++}
++
++function pciDevice(
++  sys: string,
++  bdf: string,
++  opts: {
++    vendor: string;
++    device: string;
++    classCode: string;
++    driver?: string;
++    numa?: string;
++    iommu?: string;
++    currentSpeed?: string;
++    currentWidth?: string;
++    maxSpeed?: string;
++    maxWidth?: string;
++    aerCorrectable?: string;
++    aerUncorrectable?: string;
++    tempMilliC?: string;
++    runtime?: string;
++  },
++): string {
++  const root = join(sys, 'bus/pci/devices', bdf);
++  write(join(root, 'vendor'), `0x${opts.vendor}\n`);
++  write(join(root, 'device'), `0x${opts.device}\n`);
++  write(join(root, 'class'), `0x${opts.classCode}\n`);
++  write(join(root, 'numa_node'), `${opts.numa ?? '0'}\n`);
++  write(join(root, 'current_link_speed'), `${opts.currentSpeed ?? '16.0 GT/s PCIe'}\n`);
++  write(join(root, 'current_link_width'), `${opts.currentWidth ?? '16'}\n`);
++  write(join(root, 'max_link_speed'), `${opts.maxSpeed ?? '32.0 GT/s PCIe'}\n`);
++  write(join(root, 'max_link_width'), `${opts.maxWidth ?? '16'}\n`);
++  write(join(root, 'power/runtime_status'), `${opts.runtime ?? 'active'}\n`);
++  if (opts.iommu) {
++    mkdirSync(join(sys, 'kernel/iommu_groups', opts.iommu), { recursive: true });
++    symlinkSync(join(sys, 'kernel/iommu_groups', opts.iommu), join(root, 'iommu_group'));
++  }
++  if (opts.driver) {
++    const drv = join(sys, 'bus/pci/drivers', opts.driver);
++    mkdirSync(drv, { recursive: true });
++    symlinkSync(drv, join(root, 'driver'));
++  }
++  if (opts.aerCorrectable) {
++    write(join(root, 'aer_dev_correctable'), opts.aerCorrectable);
++  }
++  if (opts.aerUncorrectable) {
++    write(join(root, 'aer_dev_fatal'), opts.aerUncorrectable);
++  }
++  if (opts.tempMilliC) {
++    write(join(root, 'hwmon/hwmon0/temp1_input'), `${opts.tempMilliC}\n`);
++  }
++  return root;
++}
++
++describe('accelerator inventory · empty host', () => {
++  it('lists allowlisted families as waitingForHardware and invents no devices', () => {
++    const sys = join(workdir, 'empty', 'sys');
++    mkdirSync(join(sys, 'bus/pci/devices'), { recursive: true });
++    const dash = py<{ devices: unknown[]; waitingForHardware: string[]; available: boolean }>(
++      `print(json.dumps(ai.live_dashboard(sys_root=${JSON.stringify(sys)})))`,
++    );
++    expect(dash.available).toBe(true);
++    expect(dash.devices).toEqual([]);
++    expect(dash.waitingForHardware).toEqual(
++      expect.arrayContaining(['npu-gaudi', 'npu-qaic', 'tpu-coral', 'fpga-alveo', 'fpga-intel-dfl']),
++    );
++  });
++});
++
++describe('accelerator inventory · allowlisted cards', () => {
++  it('classifies Gaudi 3 PCIe, Coral TPU, and Alveo FPGA with measured link/AER/temp', () => {
++    const sys = join(workdir, 'cards', 'sys');
++    mkdirSync(join(sys, 'bus/pci/devices'), { recursive: true });
++    pciDevice(sys, '0000:3d:00.0', {
++      vendor: '1da3',
++      device: '1063',
++      classCode: '120000',
++      driver: 'vfio-pci',
++      iommu: '12',
++      currentSpeed: '16.0 GT/s PCIe',
++      maxSpeed: '32.0 GT/s PCIe',
++      aerCorrectable: 'RxErr 4\nBadTLP 0\n',
++      tempMilliC: '62000',
++    });
++    pciDevice(sys, '0000:04:00.0', {
++      vendor: '1ac1',
++      device: '089a',
++      classCode: '088000',
++      driver: 'apex',
++      iommu: '8',
++      currentSpeed: '5.0 GT/s PCIe',
++      maxSpeed: '5.0 GT/s PCIe',
++      currentWidth: '1',
++      maxWidth: '1',
++    });
++    pciDevice(sys, '0000:81:00.0', {
++      vendor: '10ee',
++      device: '5000',
++      classCode: '120000',
++      driver: 'vfio-pci',
++      numa: '1',
++      iommu: '21',
++      currentSpeed: '16.0 GT/s PCIe',
++      maxSpeed: '16.0 GT/s PCIe',
++    });
++
++    const dash = py<{
++      devices: Array<{
++        bdf: string;
++        kind: string;
++        model: string;
++        driver: string | null;
++        utilizationPercent: number | null;
++        temperatureC: number | null;
++        aerCorrectable: number | null;
++        linkDownshifted: boolean;
++        issues: string[];
++      }>;
++      waitingForHardware: string[];
++      issues: string[];
++    }>(`print(json.dumps(ai.live_dashboard(sys_root=${JSON.stringify(sys)})))`);
++
++    const byBdf = Object.fromEntries(dash.devices.map((d) => [d.bdf, d]));
++    expect(byBdf['0000:3d:00.0'].kind).toBe('npu');
++    expect(byBdf['0000:3d:00.0'].model).toMatch(/Gaudi 3/);
++    expect(byBdf['0000:3d:00.0'].driver).toBe('vfio-pci');
++    expect(byBdf['0000:3d:00.0'].utilizationPercent).toBeNull();
++    expect(byBdf['0000:3d:00.0'].temperatureC).toBe(62);
++    expect(byBdf['0000:3d:00.0'].aerCorrectable).toBe(4);
++    expect(byBdf['0000:3d:00.0'].linkDownshifted).toBe(true);
++    expect(byBdf['0000:3d:00.0'].issues).toEqual(expect.arrayContaining(['pcie-link-downshifted', 'aer-correctable']));
++
++    expect(byBdf['0000:04:00.0'].kind).toBe('tpu');
++    expect(byBdf['0000:81:00.0'].kind).toBe('fpga');
++    expect(dash.waitingForHardware).not.toContain('npu-gaudi');
++    expect(dash.waitingForHardware).not.toContain('tpu-coral');
++    expect(dash.waitingForHardware).not.toContain('fpga-alveo');
++    expect(dash.issues.length).toBeGreaterThan(0);
++  });
++
++  it('does not claim Intel NICs or NVIDIA NICs; does claim display-class NVIDIA GPUs', () => {
++    const sys = join(workdir, 'filter', 'sys');
++    mkdirSync(join(sys, 'bus/pci/devices'), { recursive: true });
++    pciDevice(sys, '0000:01:00.0', { vendor: '8086', device: '1521', classCode: '020000' });
++    pciDevice(sys, '0000:02:00.0', { vendor: '10de', device: '22a3', classCode: '020000' });
++    pciDevice(sys, '0000:03:00.0', { vendor: '10de', device: '2330', classCode: '030200', driver: 'vfio-pci' });
++    pciDevice(sys, '0000:d8:00.0', { vendor: '17cb', device: 'a100', classCode: '120000', driver: 'qaic' });
++
++    const dash = py<{ devices: Array<{ bdf: string; kind: string }> }>(
++      `print(json.dumps(ai.live_dashboard(sys_root=${JSON.stringify(sys)})))`,
++    );
++    const bdfs = dash.devices.map((d) => d.bdf);
++    expect(bdfs).toContain('0000:03:00.0');
++    expect(bdfs).toContain('0000:d8:00.0');
++    expect(bdfs).not.toContain('0000:01:00.0');
++    expect(bdfs).not.toContain('0000:02:00.0');
++    expect(dash.devices.find((d) => d.bdf === '0000:03:00.0')?.kind).toBe('gpu');
++    expect(dash.devices.find((d) => d.bdf === '0000:d8:00.0')?.kind).toBe('npu');
++  });
++
++  it('follows Intel DFL fpga_region sysfs to the parent PCI device', () => {
++    const sys = join(workdir, 'dfl', 'sys');
++    mkdirSync(join(sys, 'bus/pci/devices'), { recursive: true });
++    const pci = pciDevice(sys, '0000:af:00.0', {
++      vendor: '8086',
++      device: '0b30',
++      classCode: '120000',
++      driver: 'dfl-pci',
++    });
++    const region = join(sys, 'class/fpga_region/region0');
++    mkdirSync(region, { recursive: true });
++    symlinkSync(pci, join(region, 'device'));
++
++    const dash = py<{ devices: Array<{ bdf: string; kind: string; model: string }>; waitingForHardware: string[] }>(
++      `print(json.dumps(ai.live_dashboard(sys_root=${JSON.stringify(sys)})))`,
++    );
++    expect(dash.devices).toEqual(
++      expect.arrayContaining([expect.objectContaining({ bdf: '0000:af:00.0', kind: 'fpga' })]),
++    );
++    expect(dash.waitingForHardware).not.toContain('fpga-intel-dfl');
++  });
++
++  it('flags missing IOMMU and unbound driver as issues', () => {
++    const sys = join(workdir, 'issues', 'sys');
++    mkdirSync(join(sys, 'bus/pci/devices'), { recursive: true });
++    pciDevice(sys, '0000:05:00.0', {
++      vendor: '1da3',
++      device: '1020',
++      classCode: '120000',
++    });
++    const dash = py<{ devices: Array<{ issues: string[] }>; issues: string[] }>(
++      `print(json.dumps(ai.live_dashboard(sys_root=${JSON.stringify(sys)})))`,
++    );
++    expect(dash.devices[0].issues).toEqual(expect.arrayContaining(['no-driver', 'no-iommu']));
++    expect(dash.issues.join(' ')).toMatch(/no-driver|no-iommu/);
++  });
++});
+diff --git a/src/App.tsx b/src/App.tsx
+index 7b8a4c24..696870fb 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -531,7 +531,13 @@ function App() {
+           telemetry={telemetryState}
+           onTelemetryModeChange={setRequestedMode}
+         />
+-        {cockpitView === 'mission-control' && <MissionControlView telemetry={telemetry} dataSource={dataSource} />}
++        {cockpitView === 'mission-control' && (
++          <MissionControlView
++            telemetry={telemetry}
++            dataSource={dataSource}
++            acceleration={clusterDashboards.acceleration}
++          />
++        )}
+         {cockpitView === 'telemetry-wave' && <TelemetryWaveView telemetry={telemetry} dataSource={dataSource} />}
+         {cockpitView === 'networking' && (
+           <NetworkingDashboardView
+@@ -586,7 +592,13 @@ function App() {
+         )}
+         {cockpitView === 'activity' && <ActivityDashboardView dataSource={dataSource} />}
+         {cockpitView === 'poly-compute' && <PolyComputeDashboardView telemetry={telemetry} dataSource={dataSource} />}
+-        {cockpitView === 'acceleration' && <AccelerationDashboardView telemetry={telemetry} dataSource={dataSource} />}
++        {cockpitView === 'acceleration' && (
++          <AccelerationDashboardView
++            telemetry={telemetry}
++            dataSource={dataSource}
++            acceleration={clusterDashboards.acceleration}
++          />
++        )}
+         {cockpitView === 'operations' && (
+           <OperationsDashboardView telemetry={telemetry} dataSource={dataSource} operationsLinks={clusterDashboards.operations} />
+         )}
+diff --git a/src/components/dashboards/Dashboards.tsx b/src/components/dashboards/Dashboards.tsx
+index 19ecaf8f..0d160e70 100644
+--- a/src/components/dashboards/Dashboards.tsx
++++ b/src/components/dashboards/Dashboards.tsx
+@@ -71,6 +71,7 @@ interface DashboardViewProps {
+     notes?: string[];
+     error?: string;
+   };
++  acceleration?: import('../../lib/dashboards').AccelerationDashboard;
+   onCreateWorkload?: (kind?: 'kubevirt-vm' | 'incus-lxc' | 'k8s-pod') => void;
+   onConfigureStorage?: () => void;
+   onConfigureNetwork?: () => void;
+@@ -1706,57 +1707,137 @@ export function PolyComputeDashboardView({ telemetry, dataSource }: DashboardVie
+   );
+ }
+ 
+-export function AccelerationDashboardView({ telemetry, dataSource }: DashboardViewProps = {}) {
+-  if (dataSource === 'live') {
+-    return <DemoCatalogPlaceholder viewName="Acceleration & Hardware Pass-Through" dataSource={dataSource} />;
+-  }
+-  const { features, numaPinning, passThrough, nestedClusters, dpdkPorts, spdkLanes } = accel;
++export function AccelerationDashboardView({ telemetry, dataSource, acceleration }: DashboardViewProps = {}) {
++  const isLive = dataSource === 'live';
++  const catalog = isLive ? (acceleration ?? { ...accel, passThrough: [], features: [], numaPinning: [], nestedClusters: [], dpdkPorts: [], spdkLanes: [], available: false }) : accel;
++  const { features, numaPinning, passThrough, nestedClusters, dpdkPorts, spdkLanes } = catalog;
+   const liveFeatures = useMemo(() => {
++    if (isLive) return features;
+     if (!telemetry) return features;
+     const drift = ((telemetry.tick * 3) % 12) - 6;
+     return features.map((feature) => ({
+       ...feature,
+       utilizationPercent: Math.max(8, Math.min(99, feature.utilizationPercent + drift)),
+     }));
+-  }, [telemetry]);
++  }, [telemetry, features, isLive]);
+   const liveDpdk = useMemo(() => {
+-    if (!telemetry) return dpdkPorts;
++    if (isLive || !telemetry) return dpdkPorts;
+     const factor = telemetry.ingressMbps / 78_420;
+     return dpdkPorts.map((port) => ({
+       ...port,
+       loadPercent: Math.max(8, Math.min(99, Math.round(port.loadPercent * factor))),
+       packetsPerSecond: Math.round(port.packetsPerSecond * factor),
+     }));
+-  }, [telemetry]);
++  }, [telemetry, dpdkPorts, isLive]);
++  const issueCount = (catalog.issues?.length ?? 0) + passThrough.reduce((sum, dev) => sum + (dev.issues?.length ?? 0), 0);
++  const polarBars = isLive
++    ? passThrough.map((dev) => ({
++        label: dev.model.replace(/^Intel |^Google |^AMD /, '').slice(0, 18),
++        value: dev.temperatureC ?? (dev.issues?.length ? 12 : 0),
++      }))
++    : liveFeatures.slice(0, 8).map((f) => ({ label: f.label, value: f.utilizationPercent }));
++  const polarAvg = polarBars.length
++    ? Math.round(polarBars.reduce((a, f) => a + f.value, 0) / polarBars.length)
++    : 0;
++  const numaGroups = useMemo(() => {
++    if (!isLive) {
++      return {
++        groups: [
++          { label: 'numa-0', color: 'var(--theme-accent)' },
++          { label: 'numa-1', color: 'var(--theme-accent-2)' },
++          { label: 'gpu-A100', color: 'var(--theme-good)' },
++          { label: 'gpu-H100', color: 'var(--theme-good)' },
++          { label: 'fpga', color: 'var(--theme-warn)' },
++          { label: 'smart-NIC', color: 'var(--theme-danger)' },
++        ],
++        links: [
++          { source: 0, target: 2, value: 18 },
++          { source: 0, target: 4, value: 12 },
++          { source: 0, target: 5, value: 14 },
++          { source: 1, target: 3, value: 22 },
++          { source: 1, target: 5, value: 10 },
++          { source: 1, target: 4, value: 8 },
++          { source: 2, target: 1, value: 6 },
++          { source: 3, target: 0, value: 9 },
++        ],
++      };
++    }
++    const numaIds = [...new Set(passThrough.map((d) => (d.numaNode == null ? 'unknown' : `numa-${d.numaNode}`)))];
++    const groups = [
++      ...numaIds.map((label, idx) => ({
++        label,
++        color: idx % 2 === 0 ? 'var(--theme-accent)' : 'var(--theme-accent-2)',
++      })),
++      ...passThrough.map((dev) => ({
++        label: `${dev.kind}:${dev.id.slice(-7)}`,
++        color: dev.issues?.length ? 'var(--theme-danger)' : 'var(--theme-good)',
++      })),
++    ];
++    const links = passThrough.map((dev, idx) => {
++      const numaLabel = dev.numaNode == null ? 'unknown' : `numa-${dev.numaNode}`;
++      const source = Math.max(0, numaIds.indexOf(numaLabel));
++      return { source, target: numaIds.length + idx, value: dev.temperatureC ?? 10 };
++    });
++    return { groups, links };
++  }, [isLive, passThrough]);
+   return (
+     <section className="dash dash-acceleration" aria-label="Acceleration and pass-through dashboard">
+       <RouteDecoration />
+       <header className="dash-header">
+         <div>
+           <span className="dash-kicker">SILICON // ACCEL</span>
+-          <h2>{accel.title}</h2>
+-          <p>SPDK, DPDK, vhost-user fast paths · NUMA pinning + 1 GiB hugepages · GPU / FPGA / smart-NIC pass-through · nested virtualization for AI/ML.</p>
++          <h2>{catalog.title}</h2>
++          <p>
++            {isLive
++              ? 'Measured PCIe NPU / TPU / FPGA / GPU inventory. Utilization stays unavailable unless the vendor exports it; issues come from link, AER, driver, and IOMMU.'
++              : 'SPDK, DPDK, vhost-user fast paths · NUMA pinning + 1 GiB hugepages · GPU / FPGA / smart-NIC pass-through · nested virtualization for AI/ML.'}
++          </p>
+         </div>
+         <div className="dash-totals">
+-          <div><span>Features</span><strong>{features.filter((f) => f.enabled).length}/{features.length}</strong></div>
+-          <div><span>Pass-through</span><strong>{passThrough.length}</strong></div>
+-          <div><span>Nested</span><strong>{nestedClusters.length}</strong></div>
++          <div><span>Cards</span><strong>{passThrough.length}</strong></div>
++          <div><span>Issues</span><strong>{issueCount}</strong></div>
++          <div><span>{isLive ? 'Waiting' : 'Nested'}</span><strong>{isLive ? (catalog.waitingForHardware?.length ?? 0) : nestedClusters.length}</strong></div>
+         </div>
+       </header>
+ 
++      {isLive && (catalog.waitingForHardware?.length ?? 0) > 0 ? (
++        <article className="dash-panel live-empty-panel">
++          <div className="panel-title"><span>Waiting for hardware</span><strong>{catalog.waitingForHardware?.length}</strong></div>
++          <p>Allowlisted families not on this node: {catalog.waitingForHardware?.join(', ')}.</p>
++        </article>
++      ) : null}
++
++      {isLive && (catalog.issues?.length ?? 0) > 0 ? (
++        <article className="dash-panel">
++          <div className="panel-title"><span>Hardware issues</span><strong>{catalog.issues?.length}</strong></div>
++          <ul className="passthrough-list">
++            {(catalog.issues ?? []).map((issue) => (
++              <li key={issue} className="pt-fpga">
++                <span className="kind-chip kind-file">issue</span>
++                <strong>{issue}</strong>
++              </li>
++            ))}
++          </ul>
++        </article>
++      ) : null}
++
+       <div className="dash-row dash-row-2">
+         <article className="dash-panel">
+           <div className="panel-title">
+-            <span>Accelerator utilization · polar</span>
+-            <strong>{liveFeatures.length} fast paths</strong>
++            <span>{isLive ? 'Card thermals · polar' : 'Accelerator utilization · polar'}</span>
++            <strong>{isLive ? `${passThrough.length} cards` : `${liveFeatures.length} fast paths`}</strong>
+           </div>
+           <div style={{ display: 'flex', justifyContent: 'center' }}>
+-            <RadialBarChart
+-              bars={liveFeatures.slice(0, 8).map((f) => ({ label: f.label, value: f.utilizationPercent }))}
+-              size={300}
+-              innerLabel="ACCEL"
+-              innerValue={`${Math.round(liveFeatures.reduce((a, f) => a + f.utilizationPercent, 0) / liveFeatures.length)}%`}
+-            />
++            {polarBars.length === 0 ? (
++              <LiveEmptyPanel title="No accelerator cards" detail="Plug in an allowlisted NPU, TPU, FPGA, or GPU. Metrics appear from sysfs (link, AER, temp) without a catalog." />
++            ) : (
++              <RadialBarChart
++                bars={polarBars}
++                size={300}
++                innerLabel="ACCEL"
++                innerValue={isLive ? `${issueCount} iss` : `${polarAvg}%`}
++              />
++            )}
+           </div>
+         </article>
+ 
+@@ -1766,32 +1847,21 @@ export function AccelerationDashboardView({ telemetry, dataSource }: DashboardVi
+             <strong>numa node ↔ device</strong>
+           </div>
+           <div style={{ display: 'flex', justifyContent: 'center' }}>
+-            <ChordDiagram
+-              groups={[
+-                { label: 'numa-0', color: 'var(--theme-accent)' },
+-                { label: 'numa-1', color: 'var(--theme-accent-2)' },
+-                { label: 'gpu-A100', color: 'var(--theme-good)' },
+-                { label: 'gpu-H100', color: 'var(--theme-good)' },
+-                { label: 'fpga', color: 'var(--theme-warn)' },
+-                { label: 'smart-NIC', color: 'var(--theme-danger)' },
+-              ]}
+-              links={[
+-                { source: 0, target: 2, value: 18 },
+-                { source: 0, target: 4, value: 12 },
+-                { source: 0, target: 5, value: 14 },
+-                { source: 1, target: 3, value: 22 },
+-                { source: 1, target: 5, value: 10 },
+-                { source: 1, target: 4, value: 8 },
+-                { source: 2, target: 1, value: 6 },
+-                { source: 3, target: 0, value: 9 },
+-              ]}
+-              size={280}
+-              tick={telemetry?.tick ?? 0}
+-            />
++            {numaGroups.groups.length < 2 ? (
++              <p>No NUMA ↔ device mapping until a card enumerates.</p>
++            ) : (
++              <ChordDiagram
++                groups={numaGroups.groups}
++                links={numaGroups.links}
++                size={280}
++                tick={telemetry?.tick ?? 0}
++              />
++            )}
+           </div>
+         </article>
+       </div>
+ 
++      {!isLive ? (
+       <article className="dash-panel">
+         <div className="panel-title"><span>Acceleration feature mesh</span><strong>data-path · scheduling · pass-through · nested-virt</strong></div>
+         <div className="accel-feature-grid">
+@@ -1810,8 +1880,10 @@ export function AccelerationDashboardView({ telemetry, dataSource }: DashboardVi
+           ))}
+         </div>
+       </article>
++      ) : null}
+ 
+       <div className="dash-row dash-row-2">
++        {!isLive ? (
+         <article className="dash-panel">
+           <div className="panel-title"><span>NUMA pinning + hugepages</span><strong>{numaPinning.length} workloads pinned</strong></div>
+           <table className="dash-table">
+@@ -1837,24 +1909,52 @@ export function AccelerationDashboardView({ telemetry, dataSource }: DashboardVi
+             </tbody>
+           </table>
+         </article>
++        ) : (
++        <article className="dash-panel">
++          <div className="panel-title"><span>PCIe performance</span><strong>link · AER · runtime</strong></div>
++          <table className="dash-table">
++            <thead><tr><th>bdf</th><th>kind</th><th>link</th><th>temp</th><th>AER</th><th>runtime</th></tr></thead>
++            <tbody>
++              {passThrough.length === 0 ? (
++                <tr><td colSpan={6}>No allowlisted cards on this node.</td></tr>
++              ) : passThrough.map((dev) => (
++                <tr key={dev.id}>
++                  <td><code>{dev.id}</code></td>
++                  <td>{dev.kind}</td>
++                  <td>
++                    {dev.currentLinkSpeed ?? '—'}
++                    {dev.linkDownshifted ? ' ↓' : ''}
++                  </td>
++                  <td>{dev.temperatureC == null ? '—' : `${dev.temperatureC}°C`}</td>
++                  <td>{dev.aerCorrectable == null && dev.aerUncorrectable == null ? '—' : `${dev.aerCorrectable ?? 0}c / ${dev.aerUncorrectable ?? 0}u`}</td>
++                  <td>{dev.runtimeStatus ?? '—'}</td>
++                </tr>
++              ))}
++            </tbody>
++          </table>
++        </article>
++        )}
+ 
+         <article className="dash-panel">
+-          <div className="panel-title"><span>Pass-through devices</span><strong>vfio-pci · SR-IOV · mdev</strong></div>
++          <div className="panel-title"><span>Pass-through devices</span><strong>{isLive ? 'sysfs inventory' : 'vfio-pci · SR-IOV · mdev'}</strong></div>
+           <ul className="passthrough-list">
+             {passThrough.map((dev) => (
+-              <li key={dev.id} className={`pt-${dev.kind}`}>
+-                <span className={`kind-chip kind-${dev.kind === 'gpu' ? 'block' : dev.kind === 'fpga' ? 'object' : 'file'}`}>{dev.kind}</span>
++              <li key={dev.id} className={`pt-${dev.kind === 'npu' ? 'fpga' : dev.kind}`}>
++                <span className={`kind-chip kind-${dev.kind === 'gpu' ? 'block' : dev.kind === 'fpga' || dev.kind === 'npu' ? 'object' : 'file'}`}>{dev.kind}</span>
+                 <strong>{dev.model}</strong>
+-                <small>→ {dev.boundTo} · driver {dev.driver}</small>
+-                <div className="cost-bar"><i style={{ width: `${dev.utilizationPercent}%` }} /></div>
+-                <b>{dev.utilizationPercent}%</b>
+-                <em>{dev.memoryGiB} GiB</em>
++                <small>→ {dev.boundTo} · driver {dev.driver}{dev.numaNode == null ? '' : ` · numa-${dev.numaNode}`}</small>
++                {dev.issues && dev.issues.length > 0 ? <small>{dev.issues.join(', ')}</small> : null}
++                <div className="cost-bar"><i style={{ width: `${dev.utilizationPercent ?? 0}%` }} /></div>
++                <b>{dev.utilizationPercent == null ? '—' : `${dev.utilizationPercent}%`}</b>
++                <em>{dev.memoryGiB == null ? '—' : `${dev.memoryGiB} GiB`}</em>
+               </li>
+             ))}
+           </ul>
+         </article>
+       </div>
+ 
++      {!isLive ? (
++      <>
+       <div className="dash-row dash-row-2">
+         <article className="dash-panel">
+           <div className="panel-title"><span>SPDK userspace lanes</span><strong>NVMe-oF · Vitastor · Ceph</strong></div>
+@@ -1898,6 +1998,8 @@ export function AccelerationDashboardView({ telemetry, dataSource }: DashboardVi
+           ))}
+         </ul>
+       </article>
++      </>
++      ) : null}
+     </section>
+   );
+ }
+diff --git a/src/components/dashboards/MissionControl.tsx b/src/components/dashboards/MissionControl.tsx
+index b3dbb300..ca9a8eb2 100644
+--- a/src/components/dashboards/MissionControl.tsx
++++ b/src/components/dashboards/MissionControl.tsx
+@@ -53,9 +53,16 @@ const channelOf: Record<string, 'mgmt' | 'storage' | 'mesh' | 'vm' | 'gitops'> =
+ interface MissionControlProps {
+   telemetry?: EnvironmentSnapshot;
+   dataSource?: import('../../lib/telemetry/dashboardAdapters').TelemetryDataSource;
++  acceleration?: import('../../lib/dashboards').AccelerationDashboard;
+ }
+ 
+-function LiveMissionControl({ telemetry }: { telemetry?: EnvironmentSnapshot }) {
++function LiveMissionControl({
++  telemetry,
++  acceleration,
++}: {
++  telemetry?: EnvironmentSnapshot;
++  acceleration?: import('../../lib/dashboards').AccelerationDashboard;
++}) {
+   const rings = useMemo(
+     () => [
+       { label: 'CPU pressure', value: telemetry?.cpuPercent ?? 0, color: 'accent' as const },
+@@ -103,13 +110,43 @@ function LiveMissionControl({ telemetry }: { telemetry?: EnvironmentSnapshot })
+           <small>Platform infrastructure pods are excluded. Create a VM or deploy a workload to a tenant namespace to populate fleet views.</small>
+         </article>
+       )}
++      <article className="dash-panel">
++        <WidgetTitle
++          kicker="ACCEL"
++          title="NPU / TPU / FPGA / GPU"
++          trailing={<span className="osc-readout">{acceleration?.passThrough.length ?? 0} cards · {acceleration?.issues?.length ?? 0} issues</span>}
++        />
++        {(acceleration?.passThrough.length ?? 0) === 0 ? (
++          <p>
++            No allowlisted add-in cards on this node.
++            {(acceleration?.waitingForHardware?.length ?? 0) > 0
++              ? ` Waiting: ${acceleration?.waitingForHardware?.join(', ')}.`
++              : ''}
++          </p>
++        ) : (
++          <ul className="passthrough-list">
++            {(acceleration?.passThrough ?? []).map((dev) => (
++              <li key={dev.id} className={`pt-${dev.kind === 'npu' ? 'fpga' : dev.kind}`}>
++                <span className="kind-chip">{dev.kind}</span>
++                <strong>{dev.model}</strong>
++                <small>
++                  {dev.id} · {dev.driver}
++                  {dev.temperatureC == null ? '' : ` · ${dev.temperatureC}°C`}
++                  {dev.currentLinkSpeed ? ` · ${dev.currentLinkSpeed}` : ''}
++                  {dev.issues?.length ? ` · ${dev.issues.join(', ')}` : ''}
++                </small>
++              </li>
++            ))}
++          </ul>
++        )}
++      </article>
+     </section>
+   );
+ }
+ 
+-export function MissionControlView({ telemetry, dataSource }: MissionControlProps = {}) {
++export function MissionControlView({ telemetry, dataSource, acceleration }: MissionControlProps = {}) {
+   if (dataSource === 'live') {
+-    return <LiveMissionControl telemetry={telemetry} />;
++    return <LiveMissionControl telemetry={telemetry} acceleration={acceleration} />;
+   }
+   const cpuSeries = useRollingSeries(telemetry?.cpuPercent ?? 58, 48, telemetry?.tick);
+   const ramSeries = useRollingSeries(telemetry?.ramPercent ?? 64, 48, telemetry?.tick);
+@@ -191,10 +228,10 @@ export function MissionControlView({ telemetry, dataSource }: MissionControlProp
+     () =>
+       accel.passThrough.slice(0, 6).map((dev) => ({
+         label: dev.model,
+-        value: dev.utilizationPercent,
++        value: dev.utilizationPercent ?? 0,
+         unit: '%',
+         detail: `${dev.kind} · ${dev.boundTo} · ${dev.driver}`,
+-        status: dev.utilizationPercent > 88 ? ('warn' as const) : ('good' as const),
++        status: (dev.utilizationPercent ?? 0) > 88 ? ('warn' as const) : ('good' as const),
+       })),
+     [],
+   );
+diff --git a/src/lib/dashboards.ts b/src/lib/dashboards.ts
+index fec59dc7..86abc973 100644
+--- a/src/lib/dashboards.ts
++++ b/src/lib/dashboards.ts
+@@ -453,12 +453,20 @@ export interface NumaPinningEntry {
+ 
+ export interface PassThroughDevice {
+   id: string;
+-  kind: 'gpu' | 'fpga' | 'smart-nic' | 'tpu';
++  kind: 'gpu' | 'fpga' | 'smart-nic' | 'tpu' | 'npu';
+   model: string;
+   boundTo: string;
+-  driver: 'vfio-pci' | 'mdev' | 'sr-iov';
+-  utilizationPercent: number;
+-  memoryGiB: number;
++  driver: string;
++  utilizationPercent: number | null;
++  memoryGiB: number | null;
++  issues?: string[];
++  temperatureC?: number | null;
++  numaNode?: number | null;
++  linkDownshifted?: boolean;
++  currentLinkSpeed?: string | null;
++  aerCorrectable?: number | null;
++  aerUncorrectable?: number | null;
++  runtimeStatus?: string | null;
+ }
+ 
+ export interface NestedVirtCluster {
+@@ -487,6 +495,10 @@ export interface AccelerationDashboard {
+   nestedClusters: NestedVirtCluster[];
+   dpdkPorts: DpdkRingBuffer[];
+   spdkLanes: { lane: string; queueDepth: number; latencyMicros: number; throughputGiBs: number }[];
++  available?: boolean;
++  issues?: string[];
++  waitingForHardware?: string[];
++  error?: string;
+ }
+ 
+ export interface EnvironmentZone {
+diff --git a/src/lib/telemetry/dashboardAdapters.test.ts b/src/lib/telemetry/dashboardAdapters.test.ts
+index 76e7df96..d85fd820 100644
+--- a/src/lib/telemetry/dashboardAdapters.test.ts
++++ b/src/lib/telemetry/dashboardAdapters.test.ts
+@@ -111,6 +111,38 @@ const samplePayload: DashboardTelemetryPayload = {
+     vmstat: { pgdemoteKswapd: 0, pswpin: 0 },
+     demotionEnabled: false,
+   },
++  acceleration: {
++    available: true,
++    devices: [
++      {
++        bdf: '0000:3d:00.0',
++        kind: 'npu',
++        model: 'Intel Gaudi 3 PCIe',
++        driver: 'vfio-pci',
++        utilizationPercent: null,
++        temperatureC: 62,
++        linkDownshifted: true,
++        issues: ['pcie-link-downshifted', 'aer-correctable'],
++        numaNode: 0,
++      },
++    ],
++    passThrough: [
++      {
++        id: '0000:3d:00.0',
++        kind: 'npu',
++        model: 'Intel Gaudi 3 PCIe',
++        boundTo: 'vfio-pci',
++        driver: 'vfio-pci',
++        utilizationPercent: null,
++        memoryGiB: null,
++        issues: ['pcie-link-downshifted'],
++        temperatureC: 62,
++        numaNode: 0,
++      },
++    ],
++    issues: ['0000:3d:00.0: pcie-link-downshifted'],
++    waitingForHardware: ['tpu-coral', 'fpga-alveo'],
++  },
+ };
+ 
+ describe('buildClusterDashboardBundle', () => {
+@@ -151,6 +183,18 @@ describe('buildClusterDashboardBundle', () => {
+     expect(bundle.processorMemory?.waitingForHardware).toContain('cxl');
+   });
+ 
++  it('maps live accelerator inventory onto the existing Acceleration dashboard', () => {
++    const bundle = buildClusterDashboardBundle(samplePayload, 'live');
++    expect(bundle.acceleration?.available).toBe(true);
++    expect(bundle.acceleration?.passThrough).toHaveLength(1);
++    expect(bundle.acceleration?.passThrough[0].kind).toBe('npu');
++    expect(bundle.acceleration?.passThrough[0].utilizationPercent).toBeNull();
++    expect(bundle.acceleration?.passThrough[0].issues).toContain('pcie-link-downshifted');
++    expect(bundle.acceleration?.waitingForHardware).toContain('tpu-coral');
++    expect(bundle.acceleration?.issues?.[0]).toMatch(/pcie-link-downshifted/);
++    expect(bundle.acceleration?.passThrough.some((d) => d.model.includes('Alveo U200'))).toBe(false);
++  });
++
+   it('uses live networking inventory without demo catalog merge', () => {
+     const bundle = buildClusterDashboardBundle(samplePayload, 'live');
+     expect(bundle.networking.vlans).toEqual([]);
+diff --git a/src/lib/telemetry/dashboardAdapters.ts b/src/lib/telemetry/dashboardAdapters.ts
+index 13a1a4df..46b51b83 100644
+--- a/src/lib/telemetry/dashboardAdapters.ts
++++ b/src/lib/telemetry/dashboardAdapters.ts
+@@ -3,11 +3,14 @@ import {
+   buildNetworkingDashboard,
+   buildStorageDashboard,
+   buildProcessorMemoryDashboard,
++  buildAccelerationDashboard,
+   type MachineRow,
+   type MachinesDashboard,
+   type NetworkingDashboard,
+   type StorageDashboard,
+   type ProcessorMemoryDashboard,
++  type AccelerationDashboard,
++  type PassThroughDevice,
+ } from '../dashboards';
+ import { buildResourceMonitoring, type ResourceMonitoring } from '../activeOperations';
+ import { consoleChipsFromFleet } from '../machineConsole';
+@@ -24,6 +27,8 @@ import type {
+   LiveResourceMonitoringSlice,
+   LiveStorageSlice,
+   LiveProcessorMemorySlice,
++  LiveAccelerationSlice,
++  LiveAccelDevice,
+ } from './dashboardTypes';
+ 
+ export type TelemetryDataSource = 'demo' | 'live';
+@@ -50,6 +55,7 @@ export interface ClusterDashboardBundle {
+     notes?: string[];
+     error?: string;
+   };
++  acceleration?: AccelerationDashboard;
+ }
+ 
+ const EMPTY_STORAGE: StorageDashboard = {
+@@ -375,6 +381,62 @@ function buildLiveProcessorMemory(live?: LiveProcessorMemorySlice | null): Clust
+   };
+ }
+ 
++function mapLivePassThrough(dev: LiveAccelDevice, index: number): PassThroughDevice {
++  const kind = (['gpu', 'fpga', 'smart-nic', 'tpu', 'npu'] as const).includes(dev.kind as PassThroughDevice['kind'])
++    ? (dev.kind as PassThroughDevice['kind'])
++    : 'fpga';
++  return {
++    id: dev.bdf ?? dev.id ?? `accel-${index}`,
++    kind,
++    model: dev.model,
++    boundTo: dev.boundTo ?? dev.driver ?? 'unbound',
++    driver: dev.driver ?? 'none',
++    utilizationPercent: dev.utilizationPercent ?? null,
++    memoryGiB: dev.memoryGiB ?? null,
++    issues: dev.issues ?? [],
++    temperatureC: dev.temperatureC ?? null,
++    numaNode: dev.numaNode ?? null,
++    linkDownshifted: dev.linkDownshifted,
++    currentLinkSpeed: dev.currentLinkSpeed ?? null,
++    aerCorrectable: dev.aerCorrectable ?? null,
++    aerUncorrectable: dev.aerUncorrectable ?? null,
++    runtimeStatus: dev.runtimeStatus ?? null,
++  };
++}
++
++function buildLiveAcceleration(live?: LiveAccelerationSlice | null): AccelerationDashboard {
++  const fallback = buildAccelerationDashboard();
++  if (!live || live.available === false) {
++    return {
++      ...fallback,
++      features: [],
++      numaPinning: [],
++      passThrough: [],
++      nestedClusters: [],
++      dpdkPorts: [],
++      spdkLanes: [],
++      available: false,
++      issues: live?.issues ?? [],
++      waitingForHardware: live?.waitingForHardware ?? [],
++      error: live?.error,
++    };
++  }
++  const rows = (live.passThrough?.length ? live.passThrough : live.devices) ?? [];
++  return {
++    ...fallback,
++    features: [],
++    numaPinning: [],
++    passThrough: rows.map(mapLivePassThrough),
++    nestedClusters: [],
++    dpdkPorts: [],
++    spdkLanes: [],
++    available: true,
++    issues: live.issues ?? [],
++    waitingForHardware: live.waitingForHardware ?? [],
++    error: live.error,
++  };
++}
++
+ export function buildClusterDashboardBundle(
+   payload: DashboardTelemetryPayload | null | undefined,
+   dataSource: TelemetryDataSource,
+@@ -411,6 +473,7 @@ export function buildClusterDashboardBundle(
+       xdr: undefined,
+       operations: undefined,
+       processorMemory: buildProcessorMemoryDashboard(),
++      acceleration: buildAccelerationDashboard(),
+     };
+   }
+ 
+@@ -464,6 +527,7 @@ export function buildClusterDashboardBundle(
+     xdr: payload?.xdr,
+     operations: payload?.operations,
+     processorMemory: buildLiveProcessorMemory(payload?.processorMemory),
++    acceleration: buildLiveAcceleration(payload?.acceleration),
+   };
+ 
+   const infraRows = infrastructureRowsFromPayload(payload);
+diff --git a/src/lib/telemetry/dashboardTypes.ts b/src/lib/telemetry/dashboardTypes.ts
+index 7ab854e6..b1ff8bcb 100644
+--- a/src/lib/telemetry/dashboardTypes.ts
++++ b/src/lib/telemetry/dashboardTypes.ts
+@@ -129,6 +129,34 @@ export interface LiveProcessorMemorySlice {
+   error?: string;
+ }
+ 
++export interface LiveAccelDevice {
++  id?: string;
++  bdf?: string;
++  kind: 'gpu' | 'fpga' | 'smart-nic' | 'tpu' | 'npu' | string;
++  model: string;
++  driver?: string | null;
++  boundTo?: string | null;
++  utilizationPercent?: number | null;
++  memoryGiB?: number | null;
++  temperatureC?: number | null;
++  numaNode?: number | null;
++  linkDownshifted?: boolean;
++  currentLinkSpeed?: string | null;
++  issues?: string[];
++  aerCorrectable?: number | null;
++  aerUncorrectable?: number | null;
++  runtimeStatus?: string | null;
++}
++
++export interface LiveAccelerationSlice {
++  available?: boolean;
++  devices?: LiveAccelDevice[];
++  passThrough?: LiveAccelDevice[];
++  issues?: string[];
++  waitingForHardware?: string[];
++  error?: string;
++}
++
+ export interface DashboardTelemetryPayload {
+   environment: EnvironmentTelemetryPayload;
+   storage: LiveStorageSlice;
+@@ -138,4 +166,5 @@ export interface DashboardTelemetryPayload {
+   operations: LiveOperationsSlice;
+   networking?: LiveNetworkingSlice;
+   processorMemory?: LiveProcessorMemorySlice;
++  acceleration?: LiveAccelerationSlice;
+ }
+-- 
+2.43.0
+
