@@ -1,0 +1,72 @@
+# Example: Tdarr server + a GPU-enabled AI node. By default this builds the
+# Swift-SRGAN engine (Dockerfile.tdarr-node-swiftsrgan), which reuses the model
+# from the Jellyfin-SRGAN-Plugin project with the corrected architecture.
+# To use Real-ESRGAN instead, point the build at Dockerfile.tdarr-node-realesrgan
+# and set ENGINE=real-esrgan below.
+#
+# Requires the NVIDIA driver on the host and the nvidia-container-toolkit.
+#
+#   cd tdarr-plugins
+#   docker compose -f docker/docker-compose.yml up -d --build
+#
+# Adjust the volume paths (media, cache, configs) to your setup. The server and
+# node MUST see identical paths for your media and the transcode cache.
+
+services:
+  tdarr-server:
+    image: ghcr.io/haveagitgat/tdarr:latest
+    container_name: tdarr-server
+    restart: unless-stopped
+    ports:
+      - "8265:8265" # web UI
+      - "8266:8266" # server <-> node
+    environment:
+      - TZ=Etc/UTC
+      - PUID=1000
+      - PGID=1000
+      - serverIP=0.0.0.0
+      - serverPort=8266
+      - webUIPort=8265
+    volumes:
+      - ./tdarr/server:/app/server
+      - ./tdarr/configs:/app/configs
+      - ./tdarr/logs:/app/logs
+      - /path/to/media:/media
+      - /path/to/transcode_cache:/temp
+
+  tdarr-node-ai:
+    image: tdarr-node-ai:latest
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.tdarr-node-swiftsrgan
+    container_name: tdarr-node-ai
+    restart: unless-stopped
+    depends_on:
+      - tdarr-server
+    environment:
+      - TZ=Etc/UTC
+      - PUID=1000
+      - PGID=1000
+      - nodeName=AINode
+      - serverIP=tdarr-server
+      - serverPort=8266
+      # Wrapper tunables (see the script header for the full list):
+      - ENGINE=swift-srgan
+      - TARGET_WIDTH=3840
+      - SRGAN_DENOISE=1
+      - SRGAN_DENOISE_STRENGTH=0.5
+      - NVENC_CQ=19
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+    volumes:
+      - ./tdarr/configs:/app/configs
+      - ./tdarr/logs:/app/logs
+      - /path/to/media:/media
+      - /path/to/transcode_cache:/temp
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

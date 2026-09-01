@@ -1,0 +1,52 @@
+# Custom Tdarr NODE image with NVIDIA CUDA + the corrected Swift-SRGAN engine.
+#
+# This is the DEFAULT/recommended engine: it reuses the trained model from the
+# Jellyfin-SRGAN-Plugin project (models/swift_srgan_4x.pth) with the CORRECT
+# network architecture (see swift-srgan/swift_srgan_upscale.py), so the AI
+# actually works. It is far lighter than the Real-ESRGAN image (no basicsr).
+#
+# Build (run from the tdarr-plugins/ directory so files are in context):
+#   docker build -f docker/Dockerfile.tdarr-node-swiftsrgan -t tdarr-node-ai:latest .
+#
+# Run: requires the NVIDIA driver on the host + nvidia-container-toolkit.
+# See docker-compose.yml in this folder.
+
+FROM ghcr.io/haveagitgat/tdarr_node:latest
+
+USER root
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3 python3-pip ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# PyTorch CUDA wheels bundle the CUDA runtime, so only the host NVIDIA driver
+# + nvidia-container-toolkit are required. Adjust cu121 to match your driver.
+RUN python3 -m pip install --no-cache-dir --break-system-packages \
+      torch torchvision --index-url https://download.pytorch.org/whl/cu121 \
+ && python3 -m pip install --no-cache-dir --break-system-packages "numpy<2"
+
+# Install the corrected Swift-SRGAN engine.
+COPY swift-srgan/swift_srgan_upscale.py /opt/swift-srgan/swift_srgan_upscale.py
+COPY scripts/tdarr-upscale-ai.sh /usr/local/bin/tdarr-upscale-ai.sh
+RUN chmod +x /usr/local/bin/tdarr-upscale-ai.sh
+
+# Fetch the trained Swift-SRGAN 4x weights (reused from the Jellyfin project).
+# Override at build time with --build-arg MODEL_URL=... or mount your own at
+# /opt/swift-srgan/swift_srgan_4x.pth.
+ARG MODEL_URL=https://raw.githubusercontent.com/sggr57a/Jellyfin-SRGAN-Plugin/main/models/swift_srgan_4x.pth
+RUN curl -fL "$MODEL_URL" -o /opt/swift-srgan/swift_srgan_4x.pth \
+ && python3 - <<'PY'
+# Sanity-check the model loads strictly with the corrected architecture.
+import importlib.util, torch
+spec = importlib.util.spec_from_file_location("eng", "/opt/swift-srgan/swift_srgan_upscale.py")
+eng = importlib.util.module_from_spec(spec); spec.loader.exec_module(eng)
+eng.load_generator("/opt/swift-srgan/swift_srgan_4x.pth", "cpu")
+print("Swift-SRGAN model verified: 283/283 tensors loaded (strict).")
+PY
+
+ENV ENGINE=swift-srgan \
+    SWIFT_SRGAN_DIR=/opt/swift-srgan \
+    SRGAN_MODEL_PATH=/opt/swift-srgan/swift_srgan_4x.pth
+
+WORKDIR /home/Tdarr
